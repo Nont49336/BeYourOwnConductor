@@ -1,6 +1,0 @@
-[submodule "hand-gesture-recognition-mediapipe"]
-	path = hand-gesture-recognition-mediapipe
-	url = https://github.com/kinivi/hand-gesture-recognition-mediapipe
-[submodule "vision_modules"]
-	path = vision_modules
-	url = https://github.com/kinivi/hand-gesture-recognition-mediapipe
