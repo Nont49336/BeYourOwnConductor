@@ -1,0 +1,313 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+Hand Tracking Module
+A class-based hand gesture recognition system using MediaPipe and TensorFlow Lite.
+"""
+import csv
+import copy
+import itertools
+from collections import Counter, deque
+from pathlib import Path
+
+import cv2 as cv
+import numpy as np
+import mediapipe as mp
+
+
+class HandTracking:
+    """
+    Hand gesture recognition class that processes video frames and returns gesture states.
+    
+    This class uses MediaPipe for hand detection and custom TFLite models for
+    gesture classification.
+    """
+    
+    def __init__(
+        self,
+        max_num_hands=1,
+        min_detection_confidence=0.7,
+        min_tracking_confidence=0.5,
+        use_static_image_mode=False,
+        history_length=16,
+        model_base_path=None
+    ):
+        """
+        Initialize the HandTracking system.
+        
+        Args:
+            max_num_hands: Maximum number of hands to detect
+            min_detection_confidence: Minimum confidence for hand detection
+            min_tracking_confidence: Minimum confidence for hand tracking
+            use_static_image_mode: Whether to treat each frame independently
+            history_length: Length of point history for gesture classification
+            model_base_path: Base path for model files (if None, uses default location)
+        """
+        # Initialize MediaPipe Hands
+        mp_hands = mp.solutions.hands
+        self.hands = mp_hands.Hands(
+            static_image_mode=use_static_image_mode,
+            max_num_hands=max_num_hands,
+            min_detection_confidence=min_detection_confidence,
+            min_tracking_confidence=min_tracking_confidence,
+        )
+        
+        # Set model base path
+        if model_base_path is None:
+            # Default to the hand-gesture-recognition-mediapipe folder
+            model_base_path = Path(__file__).parent / "hand-gesture-recognition-mediapipe"
+        else:
+            model_base_path = Path(model_base_path)
+        
+        # Load classification models
+        self._load_models(model_base_path)
+        
+        # Load labels
+        self._load_labels(model_base_path)
+        
+        # Initialize history tracking
+        self.history_length = history_length
+        self.point_history = deque(maxlen=history_length)
+        self.finger_gesture_history = deque(maxlen=history_length)
+        
+        # State tracking
+        self._last_results = None
+    
+    def _load_models(self, model_base_path):
+        """Load TFLite classification models."""
+        # Import here to avoid circular imports
+        import sys
+        sys.path.insert(0, str(model_base_path))
+        
+        from model.keypoint_classifier.keypoint_classifier import KeyPointClassifier
+        from model.point_history_classifier.point_history_classifier import PointHistoryClassifier
+        
+        keypoint_model_path = model_base_path / "model" / "keypoint_classifier" / "keypoint_classifier.tflite"
+        point_history_model_path = model_base_path / "model" / "point_history_classifier" / "point_history_classifier.tflite"
+        
+        self.keypoint_classifier = KeyPointClassifier(
+            model_path=str(keypoint_model_path)
+        )
+        self.point_history_classifier = PointHistoryClassifier(
+            model_path=str(point_history_model_path)
+        )
+    
+    def _load_labels(self, model_base_path):
+        """Load classification labels from CSV files."""
+        keypoint_label_path = model_base_path / "model" / "keypoint_classifier" / "keypoint_classifier_label.csv"
+        point_history_label_path = model_base_path / "model" / "point_history_classifier" / "point_history_classifier_label.csv"
+        
+        with open(keypoint_label_path, encoding='utf-8-sig') as f:
+            keypoint_classifier_labels = csv.reader(f)
+            self.keypoint_classifier_labels = [
+                row[0] for row in keypoint_classifier_labels
+            ]
+        
+        with open(point_history_label_path, encoding='utf-8-sig') as f:
+            point_history_classifier_labels = csv.reader(f)
+            self.point_history_classifier_labels = [
+                row[0] for row in point_history_classifier_labels
+            ]
+    
+    def process_frame(self, frame):
+        """
+        Process a single frame and return hand gesture information.
+        
+        Args:
+            frame: BGR image from OpenCV (numpy array)
+            
+        Returns:
+            dict: Dictionary containing:
+                - 'hand_detected': bool - Whether a hand was detected
+                - 'hand_sign_id': int - Hand sign classification ID
+                - 'hand_sign_label': str - Hand sign classification label
+                - 'finger_gesture_id': int - Finger gesture classification ID
+                - 'finger_gesture_label': str - Finger gesture classification label
+                - 'handedness': str - 'Left' or 'Right'
+                - 'landmark_list': list - Hand landmark coordinates
+                - 'bounding_rect': list - Bounding box [x1, y1, x2, y2]
+                - 'point_history': list - History of index finger tip positions
+                - 'pre_processed_landmarks': list - Normalized landmark data
+                - 'pre_processed_point_history': list - Normalized point history data
+        """
+        # Convert BGR to RGB
+        image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
+        image.flags.writeable = False
+        results = self.hands.process(image)
+        image.flags.writeable = True
+        
+        # Initialize return dictionary with default values
+        result_dict = {
+            'hand_detected': False,
+            'hand_sign_id': -1,
+            'hand_sign_label': '',
+            'finger_gesture_id': 0,
+            'finger_gesture_label': '',
+            'handedness': '',
+            'landmark_list': [],
+            'bounding_rect': [],
+            'point_history': list(self.point_history),
+            'pre_processed_landmarks': [],
+            'pre_processed_point_history': []
+        }
+        
+        # Process hand landmarks if detected
+        if results.multi_hand_landmarks is not None:
+            for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
+                                                  results.multi_handedness):
+                # Calculate bounding box
+                brect = self._calc_bounding_rect(frame, hand_landmarks)
+                
+                # Calculate landmark list
+                landmark_list = self._calc_landmark_list(frame, hand_landmarks)
+                
+                # Pre-process landmarks and point history
+                pre_processed_landmark_list = self._pre_process_landmark(landmark_list)
+                pre_processed_point_history_list = self._pre_process_point_history(
+                    frame, self.point_history
+                )
+                
+                # Hand sign classification
+                hand_sign_id = self.keypoint_classifier(pre_processed_landmark_list)
+                
+                # Update point history
+                if hand_sign_id == 2:  # Point gesture
+                    self.point_history.append(landmark_list[8])
+                else:
+                    self.point_history.append([0, 0])
+                
+                # Finger gesture classification
+                finger_gesture_id = 0
+                point_history_len = len(pre_processed_point_history_list)
+                if point_history_len == (self.history_length * 2):
+                    finger_gesture_id = self.point_history_classifier(
+                        pre_processed_point_history_list
+                    )
+                
+                # Update finger gesture history
+                self.finger_gesture_history.append(finger_gesture_id)
+                most_common_fg_id = Counter(self.finger_gesture_history).most_common()
+                
+                # Get most common finger gesture
+                if most_common_fg_id:
+                    finger_gesture_id = most_common_fg_id[0][0]
+                
+                # Build result dictionary
+                result_dict = {
+                    'hand_detected': True,
+                    'hand_sign_id': hand_sign_id,
+                    'hand_sign_label': self.keypoint_classifier_labels[hand_sign_id],
+                    'finger_gesture_id': finger_gesture_id,
+                    'finger_gesture_label': self.point_history_classifier_labels[finger_gesture_id],
+                    'handedness': handedness.classification[0].label,
+                    'landmark_list': landmark_list,
+                    'bounding_rect': brect,
+                    'point_history': list(self.point_history),
+                    'pre_processed_landmarks': pre_processed_landmark_list,
+                    'pre_processed_point_history': pre_processed_point_history_list
+                }
+                
+                # Only process first hand
+                break
+        else:
+            # No hand detected, still update point history
+            self.point_history.append([0, 0])
+        
+        self._last_results = result_dict
+        return result_dict
+    
+    def _calc_bounding_rect(self, image, landmarks):
+        """Calculate bounding rectangle for hand landmarks."""
+        image_width, image_height = image.shape[1], image.shape[0]
+        
+        landmark_array = np.empty((0, 2), int)
+        
+        for _, landmark in enumerate(landmarks.landmark):
+            landmark_x = min(int(landmark.x * image_width), image_width - 1)
+            landmark_y = min(int(landmark.y * image_height), image_height - 1)
+            
+            landmark_point = [np.array((landmark_x, landmark_y))]
+            landmark_array = np.append(landmark_array, landmark_point, axis=0)
+        
+        x, y, w, h = cv.boundingRect(landmark_array)
+        
+        return [x, y, x + w, y + h]
+    
+    def _calc_landmark_list(self, image, landmarks):
+        """Calculate landmark coordinates in image space."""
+        image_width, image_height = image.shape[1], image.shape[0]
+        
+        landmark_point = []
+        
+        for _, landmark in enumerate(landmarks.landmark):
+            landmark_x = min(int(landmark.x * image_width), image_width - 1)
+            landmark_y = min(int(landmark.y * image_height), image_height - 1)
+            
+            landmark_point.append([landmark_x, landmark_y])
+        
+        return landmark_point
+    
+    def _pre_process_landmark(self, landmark_list):
+        """Convert landmarks to relative and normalized coordinates."""
+        temp_landmark_list = copy.deepcopy(landmark_list)
+        
+        # Convert to relative coordinates
+        base_x, base_y = 0, 0
+        for index, landmark_point in enumerate(temp_landmark_list):
+            if index == 0:
+                base_x, base_y = landmark_point[0], landmark_point[1]
+            
+            temp_landmark_list[index][0] = temp_landmark_list[index][0] - base_x
+            temp_landmark_list[index][1] = temp_landmark_list[index][1] - base_y
+        
+        # Convert to one-dimensional list
+        temp_landmark_list = list(
+            itertools.chain.from_iterable(temp_landmark_list)
+        )
+        
+        # Normalization
+        max_value = max(list(map(abs, temp_landmark_list)))
+        
+        def normalize_(n):
+            return n / max_value
+        
+        temp_landmark_list = list(map(normalize_, temp_landmark_list))
+        
+        return temp_landmark_list
+    
+    def _pre_process_point_history(self, image, point_history):
+        """Convert point history to relative and normalized coordinates."""
+        image_width, image_height = image.shape[1], image.shape[0]
+        
+        temp_point_history = copy.deepcopy(point_history)
+        
+        # Convert to relative coordinates
+        base_x, base_y = 0, 0
+        for index, point in enumerate(temp_point_history):
+            if index == 0:
+                base_x, base_y = point[0], point[1]
+            
+            temp_point_history[index][0] = (temp_point_history[index][0] -
+                                            base_x) / image_width
+            temp_point_history[index][1] = (temp_point_history[index][1] -
+                                            base_y) / image_height
+        
+        # Convert to one-dimensional list
+        temp_point_history = list(
+            itertools.chain.from_iterable(temp_point_history)
+        )
+        
+        return temp_point_history
+    
+    def reset_history(self):
+        """Reset point and gesture history."""
+        self.point_history.clear()
+        self.finger_gesture_history.clear()
+    
+    def get_last_results(self):
+        """Get the last processing results."""
+        return self._last_results
+    
+    def close(self):
+        """Clean up resources."""
+        self.hands.close()
