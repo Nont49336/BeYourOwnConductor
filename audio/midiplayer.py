@@ -153,6 +153,7 @@ class DynamicMidiPlayer:
             time.sleep(msg.time * time_scale)
         
         self._all_notes_off()
+        self.running = False  # Mark as finished
         print("[MIDI] Playback finished.")
 
     def _all_notes_off(self):
