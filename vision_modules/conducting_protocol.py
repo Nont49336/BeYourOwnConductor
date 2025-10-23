@@ -136,10 +136,15 @@ class ConductingAnalyzer:
         self.neutral_duration_threshold = neutral_duration_threshold
         self.min_beat_interval = min_beat_interval
         
-        # History buffers
+        # History buffers for primary hand
         self.position_history = deque(maxlen=history_length)
         self.velocity_history = deque(maxlen=history_length)
         self.timestamp_history = deque(maxlen=history_length)
+        
+        # History buffers for secondary hand
+        self.secondary_position_history = deque(maxlen=history_length)
+        self.secondary_velocity_history = deque(maxlen=history_length)
+        self.secondary_timestamp_history = deque(maxlen=history_length)
         
         # Beat tracking
         self.beat_times = deque(maxlen=tempo_memory)
@@ -147,14 +152,19 @@ class ConductingAnalyzer:
         self.current_beat_index = 0
         self.beats_per_measure = 4  # Default to 4/4 time
         
-        # State tracking for beat detection
+        # State tracking for beat detection (primary hand)
         self.last_direction = Direction.NEUTRAL
         self.last_y_position = None
         self.current_phase = MotionPhase.TRANSITION
         
+        # State tracking for secondary hand
+        self.secondary_last_direction = Direction.NEUTRAL
+        self.secondary_current_phase = MotionPhase.TRANSITION
+        
         # Neutral detection tracking
         self.low_velocity_start_time = None  # When velocity first dropped below threshold
-        
+        self.secondary_low_velocity_start_time = None
+
     def update_position(
         self,
         position: Tuple[float, float],
@@ -162,6 +172,7 @@ class ConductingAnalyzer:
     ) -> ConductingFrame:
         """
         Update with new position data and return a conducting frame.
+        This method is only used for processing a single hand.
         
         Args:
             position: (x, y) position in normalized coordinates (0-1)
@@ -173,21 +184,75 @@ class ConductingAnalyzer:
         if timestamp is None:
             timestamp = time.time()
         
+        return self._update_primary_hand(position, timestamp)
+    
+    def update_both_hands(
+        self,
+        primary_position: Optional[Tuple[float, float]] = None,
+        secondary_position: Optional[Tuple[float, float]] = None,
+        timestamp: Optional[float] = None
+    ) -> Tuple[Optional[ConductingFrame], Optional[ConductingFrame]]:
+        """
+        Update with positions from both primary and secondary hands.
+        
+        Args:
+            primary_position: (x, y) position of primary hand in normalized coordinates (0-1)
+            secondary_position: (x, y) position of secondary hand in normalized coordinates (0-1)
+            timestamp: Optional timestamp, defaults to current time
+            
+        Returns:
+            Tuple of (primary_frame, secondary_frame) where each is a ConductingFrame or None
+            if that hand is not detected. The primary hand drives beat detection.
+        """
+        if timestamp is None:
+            timestamp = time.time()
+        
+        primary_frame = None
+        secondary_frame = None
+        
+        # Process primary hand (this drives beat detection)
+        if primary_position is not None:
+            primary_frame = self._update_primary_hand(primary_position, timestamp)
+        
+        # Process secondary hand (observational only, no beat detection)
+        if secondary_position is not None:
+            secondary_frame = self._update_secondary_hand(secondary_position, timestamp)
+        
+        return primary_frame, secondary_frame
+    
+    def _update_primary_hand(
+        self,
+        position: Tuple[float, float],
+        timestamp: float
+    ) -> ConductingFrame:
+        """
+        Update primary hand position and generate conducting frame with beat detection.
+        
+        Args:
+            position: (x, y) position in normalized coordinates (0-1)
+            timestamp: Timestamp of the position
+            
+        Returns:
+            ConductingFrame with analyzed conducting information
+        """
         # Store in history
         self.position_history.append(position)
         self.timestamp_history.append(timestamp)
         
         # Calculate velocity
-        velocity = self._calculate_velocity()
+        velocity = self._calculate_velocity(
+            self.position_history,
+            self.timestamp_history
+        )
         self.velocity_history.append(velocity)
         
         # Determine direction
-        direction = self._calculate_direction(velocity)
+        direction = self._calculate_direction(velocity, is_primary=True)
         
         # Calculate gesture energy
         gesture_energy = self._calculate_energy(velocity)
         
-        # Detect beat events
+        # Detect beat events (only for primary hand)
         beat_event = self._detect_beat(
             position, velocity, direction, gesture_energy, timestamp
         )
@@ -216,17 +281,64 @@ class ConductingAnalyzer:
             beat_event=beat_event,
             beat_index=beat_index,
             tempo_estimate=tempo_estimate,
-            gesture_energy=gesture_energy
+            gesture_energy=gesture_energy,
+            metadata={'hand': 'primary'}
         )
     
-    def _calculate_velocity(self) -> Tuple[float, float]:
+    def _update_secondary_hand(
+        self,
+        position: Tuple[float, float],
+        timestamp: float
+    ) -> ConductingFrame:
+        """
+        Update secondary hand position and generate conducting frame (no beat detection).
+        
+        Args:
+            position: (x, y) position in normalized coordinates (0-1)
+            timestamp: Timestamp of the position
+            
+        Returns:
+            ConductingFrame with motion analysis but no beat events
+        """
+        # Store in history
+        self.secondary_position_history.append(position)
+        self.secondary_timestamp_history.append(timestamp)
+        
+        # Calculate velocity
+        velocity = self._calculate_velocity(
+            self.secondary_position_history,
+            self.secondary_timestamp_history
+        )
+        self.secondary_velocity_history.append(velocity)
+        
+        # Determine direction
+        direction = self._calculate_direction(velocity, is_primary=False)
+        
+        # Calculate gesture energy
+        gesture_energy = self._calculate_energy(velocity)
+        
+        # Create and return conducting frame (no beat_event)
+        return ConductingFrame(
+            timestamp=timestamp,
+            position=position,
+            velocity=velocity,
+            direction=direction,
+            gesture_energy=gesture_energy,
+            metadata={'hand': 'secondary'}
+        )
+         
+    def _calculate_velocity(
+        self,
+        position_history: deque,
+        timestamp_history: deque
+    ) -> Tuple[float, float]:
         """Calculate smoothed velocity from position history."""
-        if len(self.position_history) < 2:
+        if len(position_history) < 2:
             return (0.0, 0.0)
         
         # Calculate instantaneous velocity
-        positions = list(self.position_history)
-        timestamps = list(self.timestamp_history)
+        positions = list(position_history)
+        timestamps = list(timestamp_history)
         
         velocities = []
         for i in range(1, min(self.velocity_smoothing + 1, len(positions))):
@@ -245,30 +357,51 @@ class ConductingAnalyzer:
         
         return (vx, vy)
     
-    def _calculate_direction(self, velocity: Tuple[float, float]) -> Direction:
+    def _calculate_direction(
+        self,
+        velocity: Tuple[float, float],
+        is_primary: bool = True
+    ) -> Direction:
         """
         Determine vertical direction from velocity vector.
         
         Neutral is detected only when velocity stays below threshold for a sustained duration,
         representing a true pause rather than just slow motion during direction changes.
+        
+        Args:
+            velocity: (vx, vy) velocity vector
+            is_primary: Whether this is for the primary hand (uses primary tracking state)
         """
         vx, vy = velocity
         current_time = time.time()
         
+        # Select the appropriate tracking variables based on hand type
+        if is_primary:
+            low_velocity_start = self.low_velocity_start_time
+        else:
+            low_velocity_start = self.secondary_low_velocity_start_time
+        
         # Check if velocity is below threshold
         if abs(vy) < self.neutral_velocity_threshold:
             # Start tracking low velocity period if not already tracking
-            if self.low_velocity_start_time is None:
-                self.low_velocity_start_time = current_time
+            if low_velocity_start is None:
+                if is_primary:
+                    self.low_velocity_start_time = current_time
+                else:
+                    self.secondary_low_velocity_start_time = current_time
+                low_velocity_start = current_time
             
             # Check if velocity has been low for long enough
-            low_velocity_duration = current_time - self.low_velocity_start_time
+            low_velocity_duration = current_time - low_velocity_start
             if low_velocity_duration >= self.neutral_duration_threshold:
                 # Sustained low velocity = true pause/neutral
                 return Direction.NEUTRAL
         else:
             # Velocity is above threshold, reset the timer
-            self.low_velocity_start_time = None
+            if is_primary:
+                self.low_velocity_start_time = None
+            else:
+                self.secondary_low_velocity_start_time = None
         
         # Determine vertical direction based on velocity
         # In image coordinates, positive y is DOWN
@@ -417,15 +550,32 @@ class ConductingAnalyzer:
     
     def reset(self):
         """Reset all tracking state."""
+        # Primary hand state
         self.position_history.clear()
         self.velocity_history.clear()
         self.timestamp_history.clear()
+        
+        # Secondary hand state
+        self.secondary_position_history.clear()
+        self.secondary_velocity_history.clear()
+        self.secondary_timestamp_history.clear()
+        
+        # Beat tracking
         self.beat_times.clear()
         self.last_beat_time = 0.0
         self.current_beat_index = 0
+        
+        # Direction tracking
         self.last_direction = Direction.NEUTRAL
+        self.secondary_last_direction = Direction.NEUTRAL
+        
+        # Phase tracking
         self.current_phase = MotionPhase.TRANSITION
+        self.secondary_current_phase = MotionPhase.TRANSITION
+        
+        # Neutral detection
         self.low_velocity_start_time = None
+        self.secondary_low_velocity_start_time = None
 
 
 class FingerConductingAnalyzer(ConductingAnalyzer):

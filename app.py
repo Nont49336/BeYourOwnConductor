@@ -165,7 +165,7 @@ def draw_info_text(image, brect, handedness, hand_sign_text, finger_gesture_text
                 (0, 0, 0), -1)
     
     # Draw handedness and hand sign
-    info_text = handedness
+    info_text = str(handedness)
     if hand_sign_text != "":
         info_text = info_text + ':' + hand_sign_text
     cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
@@ -255,27 +255,28 @@ def main():
             display_image = copy.deepcopy(frame)
             
             # Process frame with hand tracking
-            results = hand_tracker.process_frame(frame)
+            results_list = hand_tracker.process_frame(frame)
             
-            # Draw visualizations if hand detected
-            if results['hand_detected']:
-                # Draw landmarks
-                display_image = draw_landmarks(display_image, results['landmark_list'])
-                
-                # Draw bounding rectangle
-                display_image = draw_bounding_rect(display_image, results['bounding_rect'])
-                
-                # Draw info text
-                display_image = draw_info_text(
-                    display_image,
-                    results['bounding_rect'],
-                    results['handedness'],
-                    results['hand_sign_label'],
-                    results['finger_gesture_label']
-                )
-            
-            # Draw point history
-            display_image = draw_point_history(display_image, results['point_history'])
+            # Process each detected hand
+            for results in results_list:
+                if results.hand_detected:
+                    # Draw landmarks
+                    display_image = draw_landmarks(display_image, results.landmark_list)
+                    
+                    # Draw bounding rectangle
+                    display_image = draw_bounding_rect(display_image, results.bounding_rect)
+                    
+                    # Draw info text
+                    display_image = draw_info_text(
+                        display_image,
+                        results.bounding_rect,
+                        results.handedness,
+                        results.hand_sign_label,
+                        results.finger_gesture_label
+                    )
+                    
+                    # Draw point history
+                    display_image = draw_point_history(display_image, results.point_history)
             
             # Draw FPS
             display_image = draw_fps(display_image, round(avg_fps, 2))

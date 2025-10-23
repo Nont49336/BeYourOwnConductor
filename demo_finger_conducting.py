@@ -41,6 +41,8 @@ def get_args():
                        help='Beats per measure (default: 4 for 4/4 time)')
     parser.add_argument("--primary_hand", type=str, default=Handedness.RIGHT.value,
                        help='Primary conducting hand: "right" or "left" (default: right)')
+    parser.add_argument("--num_hands", type=int, default=2,
+                        help='Maximum number of hands to track (default: 2)')
     
     return parser.parse_args()
 
@@ -224,7 +226,7 @@ def main():
     
     # Initialize hand tracking
     hand_tracker = HandTracking(
-        max_num_hands=1,
+        max_num_hands=args.num_hands,
         min_detection_confidence=0.7,
         min_tracking_confidence=0.5,
         history_length=16
@@ -251,6 +253,7 @@ def main():
     # Initialize point history for trail visualization
     history_length = 32  # Length of the trail
     point_history = deque(maxlen=history_length)
+    secondary_point_history = deque(maxlen=history_length)
     
     # Beat display tracking
     import time
@@ -317,45 +320,82 @@ def main():
             
             # Process frame with hand tracking
             hand_results = hand_tracker.process_frame(frame)
-            primary_hand_results = hand_results.get(primary_hand)
             
-            # Convert hand tracking to conducting frame
-            conducting_frame = None
+            # Find primary and secondary hand results from the list
+            primary_hand_results = None
+            secondary_hand_results = None
+            for result in hand_results:
+                if result.handedness == primary_hand:
+                    primary_hand_results = result
+                else:
+                    secondary_hand_results = result
+            
+            # Extract positions for both hands
+            primary_position = None
+            secondary_position = None
+            h, w = frame.shape[:2]
+            
             if primary_hand_results is not None and primary_hand_results.hand_detected:
-                # Get index finger tip position (landmark 8)
                 landmark_list = primary_hand_results.landmark_list
                 if len(landmark_list) > 8:
                     finger_tip = landmark_list[8]
-                    h, w = frame.shape[:2]
-                    
                     # Add to point history for trail visualization
                     point_history.append(finger_tip)
-                    
                     # Normalize position to 0-1
-                    normalized_pos = (finger_tip[0] / w, finger_tip[1] / h)
-                    
-                    # Update conducting analyzer
-                    conducting_frame = conducting_analyzer.update_position(
-                        normalized_pos,
-                        timestamp=primary_hand_results.timestamp,
-                    )
-                    
-                    # Track beat events
-                    if conducting_frame.beat_event:
-                        last_beat_time = time.time()
-                        beat_position = finger_tip  # Store beat position for trail highlight
-                        print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
-                              f"tempo {conducting_frame.tempo_estimate} BPM")
-                        
-                        # Sync MIDI player tempo with conducting tempo
-                        if player is not None and player.running and conducting_frame.tempo_estimate:
-                            player.set_bpm(conducting_frame.tempo_estimate)
+                    primary_position = (finger_tip[0] / w, finger_tip[1] / h)
             else:
-                # No hand detected, add empty point
+                # No primary hand detected, add empty point
                 point_history.append([0, 0])
+            
+            if secondary_hand_results is not None and secondary_hand_results.hand_detected:
+                landmark_list = secondary_hand_results.landmark_list
+                if len(landmark_list) > 8:
+                    finger_tip = landmark_list[8]
+                    # Add to secondary point history for trail visualization
+                    secondary_point_history.append(finger_tip)
+                    # Normalize position to 0-1
+                    secondary_position = (finger_tip[0] / w, finger_tip[1] / h)
+            else:
+                # No secondary hand detected, add empty point
+                secondary_point_history.append([0, 0])
+            
+            # Update conducting analyzer with both hands
+            conducting_frame, secondary_conducting_frame = conducting_analyzer.update_both_hands(
+                primary_position=primary_position,
+                secondary_position=secondary_position,
+                timestamp=primary_hand_results.timestamp if primary_hand_results else None
+            )
+            
+            # Track beat events (only from primary hand)
+            if conducting_frame and conducting_frame.beat_event:
+                last_beat_time = time.time()
+                # Get beat position from primary hand for trail highlight
+                if primary_hand_results and len(primary_hand_results.landmark_list) > 8:
+                    beat_position = primary_hand_results.landmark_list[8]
+                print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
+                      f"tempo {conducting_frame.tempo_estimate} BPM")
+                
+                # Sync MIDI player tempo with conducting tempo
+                if player is not None and player.running and conducting_frame.tempo_estimate:
+                    player.set_bpm(conducting_frame.tempo_estimate)
+            
+            # Track sound effects (only from secondary hand)
+            if secondary_conducting_frame:
+                # Only adjust volume if secondary hand is moving (not neutral)
+                if secondary_conducting_frame.direction != Direction.NEUTRAL:
+                    # Adjust volume based on secondary hand position (higher = louder)
+                    max_y_pos = 0.8  # Lower bound for volume scaling
+                    min_y_pos = 0.2  # Upper bound for volume scaling
+                    tracked_vol_position = 1.0 - max(min_y_pos, min(max_y_pos, secondary_conducting_frame.position[1]))
+                    vol_level = tracked_vol_position * (2.0 - 0.5) + 0.5  # Scale to 0.5 - 2.0
+
+                    if player is not None:
+                        if secondary_conducting_frame.position:
+                            player.set_volume(vol_level)
             
             # Draw point history trail with beat highlight
             display_image = draw_point_history(display_image, point_history, beat_position)
+            display_image = draw_point_history(display_image, secondary_point_history)
             
             # Draw conducting visualization
             if conducting_frame:

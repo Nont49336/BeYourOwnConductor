@@ -193,7 +193,7 @@ class HandTracking:
                 row[0] for row in point_history_classifier_labels
             ]
     
-    def process_frame(self, frame) -> Dict[Handedness, HandTrackingResult]:
+    def process_frame(self, frame) -> List[HandTrackingResult]:
         """
         Process a single frame and return hand gesture information.
         
@@ -201,8 +201,8 @@ class HandTracking:
             frame: BGR image from OpenCV (numpy array)
             
         Returns:
-            dict: Dictionary indexed by Handedness enum (Handedness.LEFT, Handedness.RIGHT).
-                  Each value is a HandTrackingResult object for that hand, or None if not detected.
+            list: List of HandTrackingResult objects, one for each detected hand.
+                  Returns empty list if no hands are detected.
         """
         # Convert BGR to RGB
         image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
@@ -210,11 +210,8 @@ class HandTracking:
         results = self.hands.process(image)
         image.flags.writeable = True
         
-        # Initialize return dictionary with None for both hands
-        results_dict = {
-            Handedness.LEFT: None,
-            Handedness.RIGHT: None
-        }
+        # Initialize return list
+        results_list = []
         detected_hands = set()
         
         # Process hand landmarks if detected
@@ -277,15 +274,15 @@ class HandTracking:
                     pre_processed_point_history=pre_processed_point_history_list
                 )
                 
-                results_dict[hand_label] = result
+                results_list.append(result)
         
         # Update point history for hands that weren't detected
         for hand_label in [Handedness.LEFT, Handedness.RIGHT]:
             if hand_label not in detected_hands:
                 self.point_history[hand_label].append([0, 0])
         
-        self._last_results = results_dict
-        return results_dict
+        self._last_results = results_list
+        return results_list
     
     def _calc_bounding_rect(self, image, landmarks):
         """Calculate bounding rectangle for hand landmarks."""
