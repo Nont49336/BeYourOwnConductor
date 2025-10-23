@@ -10,8 +10,9 @@ import argparse
 import copy
 import cv2 as cv
 from collections import deque
+import os
 
-from vision_modules.hand_tracking import HandTracking
+from vision_modules.hand_tracking import Handedness, HandTracking
 from vision_modules.conducting_protocol import (
     FingerConductingAnalyzer,
     ConductingFrame,
@@ -19,12 +20,17 @@ from vision_modules.conducting_protocol import (
     MotionPhase,
     BeatEvent
 )
+from audio.midiplayer import DynamicMidiPlayer
 
 
 def get_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Finger Conducting Demo')
     
+    parser.add_argument("--song_path", type=str, default='ode_to_joy.mid',
+                        help='Path to the MIDI file to play (default: ode_to_joy.mid)')
+    parser.add_argument("--songfont_path", type=str, default='FluidR3Mono_GM.sf3',
+                        help='Path to the SoundFont file (default: FluidR3Mono_GM.sf3)')
     parser.add_argument("--device", type=int, default=0,
                        help='Camera device number (default: 0)')
     parser.add_argument("--width", type=int, default=960,
@@ -33,6 +39,8 @@ def get_args():
                        help='Camera capture height (default: 540)')
     parser.add_argument("--time_signature", type=int, default=4,
                        help='Beats per measure (default: 4 for 4/4 time)')
+    parser.add_argument("--primary_hand", type=str, default=Handedness.RIGHT.value,
+                       help='Primary conducting hand: "right" or "left" (default: right)')
     
     return parser.parse_args()
 
@@ -150,7 +158,7 @@ def draw_pattern_guide(image, conducting_analyzer):
                 (0, 0, 0), -1)
     cv.rectangle(image, (start_x - 10, start_y - 25), (w - 10, start_y + 95),
                 (255, 255, 255), 1)
-    
+
     # Draw time signature
     time_sig_text = f"Time: {pattern_info['time_signature']}"
     cv.putText(image, time_sig_text, (start_x, start_y),
@@ -173,6 +181,37 @@ def draw_pattern_guide(image, conducting_analyzer):
     
     return image
 
+def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
+    """Load MIDI file and SoundFont into the DynamicMidiPlayer."""
+    # Check if files exist
+    if not os.path.exists(midi_path):
+        print(f"Warning: MIDI file not found: {midi_path}")
+        print(f"Please make sure '{midi_path}' is in the current directory.")
+        print("Continuing without audio playback...")
+        return None
+
+    if not os.path.exists(soundfont_path):
+        print(f"Warning: Soundfont not found: {soundfont_path}")
+        print("Continuing without audio playback...")
+        return None
+
+    # Initialize MIDI player
+    try:
+        player = DynamicMidiPlayer(soundfont_path=soundfont_path, bpm=initial_bpm)
+        success = player.load_file(midi_path)
+
+        if not success:
+            player.close()
+            raise Exception("DynamicMidiPlayer failed to load MIDI file.")
+
+        print(f"Loaded MIDI file: {midi_path}")
+        print("Press SPACE to start/pause playback")
+    except Exception as e:
+        print(f"Error initializing MIDI player: {e}")
+        print("Continuing without audio playback...")
+        return None
+
+    return player
 
 def main():
     """Main application loop."""
@@ -200,6 +239,14 @@ def main():
         neutral_duration_threshold=0.5    # Must be below threshold for 0.5s to be neutral
     )
     conducting_analyzer.set_time_signature(args.time_signature)
+
+    # Initialize MIDI player
+    INITIAL_BPM = 120.0
+    player = load_player_files(
+        midi_path=args.song_path,
+        soundfont_path=args.songfont_path,
+        initial_bpm=INITIAL_BPM
+    )
     
     # Initialize point history for trail visualization
     history_length = 32  # Length of the trail
@@ -209,6 +256,7 @@ def main():
     import time
     last_beat_time = 0.0
     beat_position = None  # Position where beat occurred
+    primary_hand = Handedness.from_str(args.primary_hand)
     
     # Get and display pattern information
     pattern_info = conducting_analyzer.get_pattern_info()
@@ -219,14 +267,26 @@ def main():
     print("Press ESC to exit")
     print("Press 'r' to reset conducting state")
     print("Press '2', '3', or '4' to change time signature")
+    print("Press SPACE to Play/Pause music")
     print("-" * 50)
-    
+
     try:
         while True:
             # Check for keys
             key = cv.waitKey(1)
             if key == 27:  # ESC
                 break
+            elif key == 32:  # SPACE
+                if player is not None:
+                    if not player.running:
+                        player.start()
+                        print("Playback started")
+                    elif player.is_paused():
+                        player.resume()
+                        print("Playback resumed")
+                    else:
+                        player.pause()
+                        print("Playback paused")
             elif key == ord('r'):  # Reset
                 conducting_analyzer.reset()
                 print("Conducting state reset")
@@ -239,6 +299,9 @@ def main():
             elif key == ord('4'):  # Switch to 4/4 time
                 conducting_analyzer.set_time_signature(4)
                 print("\nSwitched to 4/4 time")
+            elif key == ord('h'):  # Switch primary hand
+                primary_hand = Handedness.LEFT if primary_hand == Handedness.RIGHT else Handedness.RIGHT
+                print(f"\nSwitched primary hand to: {primary_hand.value}")
             
             # Capture frame
             ret, frame = cap.read()
@@ -254,12 +317,13 @@ def main():
             
             # Process frame with hand tracking
             hand_results = hand_tracker.process_frame(frame)
+            primary_hand_results = hand_results.get(primary_hand)
             
             # Convert hand tracking to conducting frame
             conducting_frame = None
-            if hand_results['hand_detected']:
+            if primary_hand_results is not None and primary_hand_results.hand_detected:
                 # Get index finger tip position (landmark 8)
-                landmark_list = hand_results['landmark_list']
+                landmark_list = primary_hand_results.landmark_list
                 if len(landmark_list) > 8:
                     finger_tip = landmark_list[8]
                     h, w = frame.shape[:2]
@@ -273,7 +337,7 @@ def main():
                     # Update conducting analyzer
                     conducting_frame = conducting_analyzer.update_position(
                         normalized_pos,
-                        timestamp=hand_results.get('timestamp')
+                        timestamp=primary_hand_results.timestamp,
                     )
                     
                     # Track beat events
@@ -282,6 +346,10 @@ def main():
                         beat_position = finger_tip  # Store beat position for trail highlight
                         print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
                               f"tempo {conducting_frame.tempo_estimate} BPM")
+                        
+                        # Sync MIDI player tempo with conducting tempo
+                        if player is not None and player.running and conducting_frame.tempo_estimate:
+                            player.set_bpm(conducting_frame.tempo_estimate)
             else:
                 # No hand detected, add empty point
                 point_history.append([0, 0])
@@ -301,6 +369,11 @@ def main():
     
     finally:
         # Clean up
+        if player is not None:
+            if player.running:
+                player.stop()
+            player.close()
+            print("MIDI player closed")
         cap.release()
         cv.destroyAllWindows()
         hand_tracker.close()

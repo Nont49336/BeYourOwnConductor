@@ -8,11 +8,86 @@ import csv
 import copy
 import itertools
 from collections import Counter, deque
+from dataclasses import dataclass, field, asdict
+from typing import List, Dict, Optional
+from enum import Enum
 from pathlib import Path
 
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
+
+
+class Handedness(Enum):
+    """Enum representing hand type (Left or Right)."""
+    LEFT = "Left"
+    RIGHT = "Right"
+
+    def __str__(self):
+        return self.value
+
+    @staticmethod
+    def from_str(label: str):
+        """Create Handedness enum from string."""
+        if label.lower() == "left":
+            return Handedness.LEFT
+        elif label.lower() == "right":
+            return Handedness.RIGHT
+        else:
+            raise ValueError(f"Unknown Handedness label: {label}")
+
+@dataclass
+class HandTrackingResult:
+    """
+    Per-frame hand tracking information for a single detected hand.
+    
+    This data structure encapsulates all hand tracking and gesture recognition
+    information for a single hand in a frame.
+    """
+    
+    # Detection status
+    hand_detected: bool = True
+    
+    # Classification results
+    hand_sign_id: int = -1
+    hand_sign_label: str = ""
+    finger_gesture_id: int = 0
+    finger_gesture_label: str = ""
+    
+    # Hand information
+    handedness: Handedness = Handedness.LEFT
+    
+    # Landmark data
+    landmark_list: List[List[int]] = field(default_factory=list)
+    bounding_rect: List[int] = field(default_factory=list)
+    
+    # History tracking
+    point_history: List[List[int]] = field(default_factory=list)
+    
+    # Pre-processed data
+    pre_processed_landmarks: List[float] = field(default_factory=list)
+    pre_processed_point_history: List[float] = field(default_factory=list)
+
+    # Timestamp
+    timestamp: Optional[float] = None
+    
+    def to_dict(self) -> dict:
+        """Convert to dictionary representation."""
+        data = asdict(self)
+        # Convert Handedness enum to string
+        data['handedness'] = str(self.handedness)
+        return data
+    
+    def __str__(self) -> str:
+        """Human-readable string representation."""
+        return (
+            f"HandTrackingResult("
+            f"hand={self.handedness}, "
+            f"detected={self.hand_detected}, "
+            f"sign={self.hand_sign_label}(id={self.hand_sign_id}), "
+            f"gesture={self.finger_gesture_label}(id={self.finger_gesture_id}), "
+            f"landmarks={len(self.landmark_list)})"
+        )
 
 
 class HandTracking:
@@ -67,11 +142,20 @@ class HandTracking:
         
         # Initialize history tracking
         self.history_length = history_length
-        self.point_history = deque(maxlen=history_length)
-        self.finger_gesture_history = deque(maxlen=history_length)
+        self.max_num_hands = max_num_hands
+        
+        # Track history for each hand separately (indexed by Handedness enum)
+        self.point_history = {
+            Handedness.LEFT: deque(maxlen=history_length),
+            Handedness.RIGHT: deque(maxlen=history_length)
+        }
+        self.finger_gesture_history = {
+            Handedness.LEFT: deque(maxlen=history_length),
+            Handedness.RIGHT: deque(maxlen=history_length)
+        }
         
         # State tracking
-        self._last_results = None
+        self._last_results = []
     
     def _load_models(self, model_base_path):
         """Load TFLite classification models."""
@@ -109,7 +193,7 @@ class HandTracking:
                 row[0] for row in point_history_classifier_labels
             ]
     
-    def process_frame(self, frame):
+    def process_frame(self, frame) -> Dict[Handedness, HandTrackingResult]:
         """
         Process a single frame and return hand gesture information.
         
@@ -117,18 +201,8 @@ class HandTracking:
             frame: BGR image from OpenCV (numpy array)
             
         Returns:
-            dict: Dictionary containing:
-                - 'hand_detected': bool - Whether a hand was detected
-                - 'hand_sign_id': int - Hand sign classification ID
-                - 'hand_sign_label': str - Hand sign classification label
-                - 'finger_gesture_id': int - Finger gesture classification ID
-                - 'finger_gesture_label': str - Finger gesture classification label
-                - 'handedness': str - 'Left' or 'Right'
-                - 'landmark_list': list - Hand landmark coordinates
-                - 'bounding_rect': list - Bounding box [x1, y1, x2, y2]
-                - 'point_history': list - History of index finger tip positions
-                - 'pre_processed_landmarks': list - Normalized landmark data
-                - 'pre_processed_point_history': list - Normalized point history data
+            dict: Dictionary indexed by Handedness enum (Handedness.LEFT, Handedness.RIGHT).
+                  Each value is a HandTrackingResult object for that hand, or None if not detected.
         """
         # Convert BGR to RGB
         image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
@@ -136,25 +210,21 @@ class HandTracking:
         results = self.hands.process(image)
         image.flags.writeable = True
         
-        # Initialize return dictionary with default values
-        result_dict = {
-            'hand_detected': False,
-            'hand_sign_id': -1,
-            'hand_sign_label': '',
-            'finger_gesture_id': 0,
-            'finger_gesture_label': '',
-            'handedness': '',
-            'landmark_list': [],
-            'bounding_rect': [],
-            'point_history': list(self.point_history),
-            'pre_processed_landmarks': [],
-            'pre_processed_point_history': []
+        # Initialize return dictionary with None for both hands
+        results_dict = {
+            Handedness.LEFT: None,
+            Handedness.RIGHT: None
         }
+        detected_hands = set()
         
         # Process hand landmarks if detected
         if results.multi_hand_landmarks is not None:
             for hand_landmarks, handedness in zip(results.multi_hand_landmarks,
                                                   results.multi_handedness):
+                hand_label_str = handedness.classification[0].label
+                hand_label = Handedness.from_str(hand_label_str)
+                detected_hands.add(hand_label)
+                
                 # Calculate bounding box
                 brect = self._calc_bounding_rect(frame, hand_landmarks)
                 
@@ -164,17 +234,17 @@ class HandTracking:
                 # Pre-process landmarks and point history
                 pre_processed_landmark_list = self._pre_process_landmark(landmark_list)
                 pre_processed_point_history_list = self._pre_process_point_history(
-                    frame, self.point_history
+                    frame, self.point_history[hand_label]
                 )
                 
                 # Hand sign classification
                 hand_sign_id = self.keypoint_classifier(pre_processed_landmark_list)
                 
-                # Update point history
+                # Update point history for this hand
                 if hand_sign_id == 2:  # Point gesture
-                    self.point_history.append(landmark_list[8])
+                    self.point_history[hand_label].append(landmark_list[8])
                 else:
-                    self.point_history.append([0, 0])
+                    self.point_history[hand_label].append([0, 0])
                 
                 # Finger gesture classification
                 finger_gesture_id = 0
@@ -184,37 +254,38 @@ class HandTracking:
                         pre_processed_point_history_list
                     )
                 
-                # Update finger gesture history
-                self.finger_gesture_history.append(finger_gesture_id)
-                most_common_fg_id = Counter(self.finger_gesture_history).most_common()
+                # Update finger gesture history for this hand
+                self.finger_gesture_history[hand_label].append(finger_gesture_id)
+                most_common_fg_id = Counter(self.finger_gesture_history[hand_label]).most_common()
                 
                 # Get most common finger gesture
                 if most_common_fg_id:
                     finger_gesture_id = most_common_fg_id[0][0]
                 
-                # Build result dictionary
-                result_dict = {
-                    'hand_detected': True,
-                    'hand_sign_id': hand_sign_id,
-                    'hand_sign_label': self.keypoint_classifier_labels[hand_sign_id],
-                    'finger_gesture_id': finger_gesture_id,
-                    'finger_gesture_label': self.point_history_classifier_labels[finger_gesture_id],
-                    'handedness': handedness.classification[0].label,
-                    'landmark_list': landmark_list,
-                    'bounding_rect': brect,
-                    'point_history': list(self.point_history),
-                    'pre_processed_landmarks': pre_processed_landmark_list,
-                    'pre_processed_point_history': pre_processed_point_history_list
-                }
+                # Build result object for this hand
+                result = HandTrackingResult(
+                    hand_detected=True,
+                    hand_sign_id=hand_sign_id,
+                    hand_sign_label=self.keypoint_classifier_labels[hand_sign_id],
+                    finger_gesture_id=finger_gesture_id,
+                    finger_gesture_label=self.point_history_classifier_labels[finger_gesture_id],
+                    handedness=hand_label,
+                    landmark_list=landmark_list,
+                    bounding_rect=brect,
+                    point_history=list(self.point_history[hand_label]),
+                    pre_processed_landmarks=pre_processed_landmark_list,
+                    pre_processed_point_history=pre_processed_point_history_list
+                )
                 
-                # Only process first hand
-                break
-        else:
-            # No hand detected, still update point history
-            self.point_history.append([0, 0])
+                results_dict[hand_label] = result
         
-        self._last_results = result_dict
-        return result_dict
+        # Update point history for hands that weren't detected
+        for hand_label in [Handedness.LEFT, Handedness.RIGHT]:
+            if hand_label not in detected_hands:
+                self.point_history[hand_label].append([0, 0])
+        
+        self._last_results = results_dict
+        return results_dict
     
     def _calc_bounding_rect(self, image, landmarks):
         """Calculate bounding rectangle for hand landmarks."""
@@ -300,9 +371,10 @@ class HandTracking:
         return temp_point_history
     
     def reset_history(self):
-        """Reset point and gesture history."""
-        self.point_history.clear()
-        self.finger_gesture_history.clear()
+        """Reset point and gesture history for all hands."""
+        for hand_label in [Handedness.LEFT, Handedness.RIGHT]:
+            self.point_history[hand_label].clear()
+            self.finger_gesture_history[hand_label].clear()
     
     def get_last_results(self):
         """Get the last processing results."""
