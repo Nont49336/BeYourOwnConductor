@@ -12,18 +12,20 @@ class DynamicMidiPlayer:
     Allows real-time adjustment of playback tempo in beats per minute.
     """
 
-    def __init__(self, soundfont_path: str, bpm: float = 120.0):
+    def __init__(self, soundfont_path: str, bpm: float = 120.0, volume: float = 1.0):
         """
         Initialize the MIDI player with FluidSynth.
         
         Args:
             soundfont_path: Path to a .sf2 or .sf3 soundfont file
             bpm: Initial tempo in beats per minute (default: 120)
+            volume: Initial volume level (0.0 to 2.0, default: 1.0)
         """
         self.midi = None
         self.midi_path = None
         self.original_tempo = None  # microseconds per beat from MIDI file
         self.current_bpm = bpm
+        self.volume = max(0.0, min(2.0, volume))  # Clamp volume between 0.0 and 2.0
         self.running = False
         self.paused = False
         self.thread = None
@@ -106,6 +108,21 @@ class DynamicMidiPlayer:
         """Get the current playback tempo in beats per minute."""
         return self.current_bpm
 
+    def set_volume(self, volume: float):
+        """
+        Set the playback volume level.
+        Changes take effect immediately (on the next MIDI note).
+        
+        Args:
+            volume: Volume level (0.0 = silent, 1.0 = full volume, 2.0 = twice full volume)
+        """
+        self.volume = max(0.0, min(2.0, volume))
+        print(f"[Volume] Volume set to: {self.volume:.2f} ({int(self.volume * 100)}%)")
+
+    def get_volume(self) -> float:
+        """Get the current volume level (0.0 to 2.0)."""
+        return self.volume
+
     def _calculate_time_scaling(self) -> float:
         """
         Calculate how much to scale the original MIDI timing.
@@ -138,7 +155,9 @@ class DynamicMidiPlayer:
             
             # Send MIDI messages to FluidSynth
             if msg.type == 'note_on':
-                self.fs.noteon(msg.channel, msg.note, msg.velocity)
+                # Apply volume scaling to velocity, clamp to MIDI max (127)
+                adjusted_velocity = min(127, int(msg.velocity * self.volume))
+                self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
             elif msg.type == 'note_off':
                 self.fs.noteoff(msg.channel, msg.note)
             elif msg.type == 'program_change':
@@ -153,6 +172,7 @@ class DynamicMidiPlayer:
             time.sleep(msg.time * time_scale)
         
         self._all_notes_off()
+        self.running = False  # Mark as finished
         print("[MIDI] Playback finished.")
 
     def _all_notes_off(self):
@@ -232,17 +252,22 @@ class DynamicMidiPlayer:
 # Example usage
 if __name__ == "__main__":
     # Update this path to your soundfont location
-    SOUNDFONT_PATH = os.path.expanduser("~/FluidR3Mono_GM.sf3")
+    # SOUNDFONT_PATH = os.path.expanduser("~/FluidR3Mono_GM.sf3")
+    SOUNDFONT_PATH = os.path.expanduser("../FluidR3Mono_GM.sf3")
     
     try:
-        # Initialize at 120 BPM
-        player = DynamicMidiPlayer(soundfont_path=SOUNDFONT_PATH, bpm=120)
+        # Initialize at 120 BPM with full volume (1.0)
+        player = DynamicMidiPlayer(soundfont_path=SOUNDFONT_PATH, bpm=120, volume=1.0)
         
         # Load a MIDI file
-        if player.load_file("your_song.mid"):
+        if player.load_file("../ode_to_joy.mid"):
             player.start()
             
-            # Play for 3 seconds at 120 BPM
+            # Play for 3 seconds at 120 BPM, full volume
+            time.sleep(3)
+            
+            # Reduce volume to 50%
+            player.set_volume(0.5)
             time.sleep(3)
             
             # Pause playback
@@ -250,21 +275,30 @@ if __name__ == "__main__":
             print("Paused for 2 seconds...")
             time.sleep(2)
             
-            # Resume playback
+            # Resume playback at lower volume
             player.resume()
+            time.sleep(2)
+            
+            # Increase volume to 80%
+            player.set_volume(0.8)
             time.sleep(3)
             
             # Speed up to 160 BPM
             player.set_bpm(160)
             time.sleep(3)
             
+            # Very loud (200% volume)
+            player.set_volume(2.0)
+            time.sleep(2)
+            
             # Pause again
             player.pause()
             time.sleep(2)
             player.resume()
             
-            # Slow down to 80 BPM
+            # Slow down to 80 BPM and full volume
             player.set_bpm(80)
+            player.set_volume(1.0)
             time.sleep(3)
             
             player.stop()
