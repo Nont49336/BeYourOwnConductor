@@ -9,7 +9,7 @@ import copy
 import itertools
 from collections import Counter, deque
 from dataclasses import dataclass, field, asdict
-from typing import List, Dict, Optional
+from typing import List, Optional, Tuple
 from enum import Enum
 from pathlib import Path
 
@@ -101,6 +101,7 @@ class HandTracking:
     def __init__(
         self,
         max_num_hands=1,
+        primary_hand=None,
         min_detection_confidence=0.7,
         min_tracking_confidence=0.7,
         use_static_image_mode=False,
@@ -112,12 +113,17 @@ class HandTracking:
         
         Args:
             max_num_hands: Maximum number of hands to detect
+            primary_hand: The primary hand to track (Handedness.LEFT or Handedness.RIGHT). If None, tracks only the first detected hand.
             min_detection_confidence: Minimum confidence for hand detection
             min_tracking_confidence: Minimum confidence for hand tracking
             use_static_image_mode: Whether to treat each frame independently
             history_length: Length of point history for gesture classification
             model_base_path: Base path for model files (if None, uses default location)
         """
+        assert max_num_hands < 2 or primary_hand is not None, "When tracking multiple hands, primary_hand must be specified."
+        assert max_num_hands <= 2, "Currently supports tracking up to 2 hands only."
+        self.primary_hand = primary_hand
+
         # Initialize MediaPipe Hands
         mp_hands = mp.solutions.hands
         self.hands = mp_hands.Hands(
@@ -193,7 +199,7 @@ class HandTracking:
                 row[0] for row in point_history_classifier_labels
             ]
     
-    def process_frame(self, frame) -> List[HandTrackingResult]:
+    def process_frame(self, frame) -> Tuple[Optional[HandTrackingResult], Optional[HandTrackingResult]]:
         """
         Process a single frame and return hand gesture information.
         
@@ -201,8 +207,9 @@ class HandTracking:
             frame: BGR image from OpenCV (numpy array)
             
         Returns:
-            list: List of HandTrackingResult objects, one for each detected hand.
-                  Returns empty list if no hands are detected.
+            tuple: A tuple containing HandTrackingResult objects.
+                The first element corresponds to the primary hand and the second to the secondary hand (if detected).
+                If a hand is not detected, its corresponding element will be None.
         """
         # Convert BGR to RGB
         image = cv.cvtColor(frame, cv.COLOR_BGR2RGB)
@@ -210,8 +217,9 @@ class HandTracking:
         results = self.hands.process(image)
         image.flags.writeable = True
         
-        # Initialize return list
-        results_list = []
+        # Initialize outputs
+        primary_result = None
+        secondary_result = None
         detected_hands = set()
         
         # Process hand landmarks if detected
@@ -221,68 +229,84 @@ class HandTracking:
                 hand_label_str = handedness.classification[0].label
                 hand_label = Handedness.from_str(hand_label_str)
                 detected_hands.add(hand_label)
-                
-                # Calculate bounding box
-                brect = self._calc_bounding_rect(frame, hand_landmarks)
-                
-                # Calculate landmark list
-                landmark_list = self._calc_landmark_list(frame, hand_landmarks)
-                
-                # Pre-process landmarks and point history
-                pre_processed_landmark_list = self._pre_process_landmark(landmark_list)
-                pre_processed_point_history_list = self._pre_process_point_history(
-                    frame, self.point_history[hand_label]
-                )
-                
-                # Hand sign classification
-                hand_sign_id = self.keypoint_classifier(pre_processed_landmark_list)
-                
-                # Update point history for this hand
-                if hand_sign_id == 2:  # Point gesture
-                    self.point_history[hand_label].append(landmark_list[8])
+
+                # No primary hand specified, return first detected hand as primary
+                if self.primary_hand is None:
+                    primary_result = self._build_hand_result(frame, hand_landmarks, handedness)
+                    break
                 else:
-                    self.point_history[hand_label].append([0, 0])
-                
-                # Finger gesture classification
-                finger_gesture_id = 0
-                point_history_len = len(pre_processed_point_history_list)
-                if point_history_len == (self.history_length * 2):
-                    finger_gesture_id = self.point_history_classifier(
-                        pre_processed_point_history_list
-                    )
-                
-                # Update finger gesture history for this hand
-                self.finger_gesture_history[hand_label].append(finger_gesture_id)
-                most_common_fg_id = Counter(self.finger_gesture_history[hand_label]).most_common()
-                
-                # Get most common finger gesture
-                if most_common_fg_id:
-                    finger_gesture_id = most_common_fg_id[0][0]
-                
-                # Build result object for this hand
-                result = HandTrackingResult(
-                    hand_detected=True,
-                    hand_sign_id=hand_sign_id,
-                    hand_sign_label=self.keypoint_classifier_labels[hand_sign_id],
-                    finger_gesture_id=finger_gesture_id,
-                    finger_gesture_label=self.point_history_classifier_labels[finger_gesture_id],
-                    handedness=hand_label,
-                    landmark_list=landmark_list,
-                    bounding_rect=brect,
-                    point_history=list(self.point_history[hand_label]),
-                    pre_processed_landmarks=pre_processed_landmark_list,
-                    pre_processed_point_history=pre_processed_point_history_list
-                )
-                
-                results_list.append(result)
-        
+                    hand_result = self._build_hand_result(frame, hand_landmarks, handedness)
+                    if hand_label == self.primary_hand:
+                        primary_result = hand_result
+                    else:
+                        secondary_result = hand_result
+
         # Update point history for hands that weren't detected
         for hand_label in [Handedness.LEFT, Handedness.RIGHT]:
             if hand_label not in detected_hands:
                 self.point_history[hand_label].append([0, 0])
+
+        # Store last results
+        self._last_results = [primary_result, secondary_result]
+
+        return primary_result, secondary_result
+    
+    def _build_hand_result(self, frame: np.ndarray, hand_landmarks, handedness) -> HandTrackingResult:
+        hand_label_str = handedness.classification[0].label
+        hand_label = Handedness.from_str(hand_label_str)
         
-        self._last_results = results_list
-        return results_list
+        # Calculate bounding box
+        brect = self._calc_bounding_rect(frame, hand_landmarks)
+        
+        # Calculate landmark list
+        landmark_list = self._calc_landmark_list(frame, hand_landmarks)
+        
+        # Pre-process landmarks and point history
+        pre_processed_landmark_list = self._pre_process_landmark(landmark_list)
+        pre_processed_point_history_list = self._pre_process_point_history(
+            frame, self.point_history[hand_label]
+        )
+        
+        # Hand sign classification
+        hand_sign_id = self.keypoint_classifier(pre_processed_landmark_list)
+        
+        # Update point history for this hand
+        if hand_sign_id == 2:  # Point gesture
+            self.point_history[hand_label].append(landmark_list[8])
+        else:
+            self.point_history[hand_label].append([0, 0])
+        
+        # Finger gesture classification
+        finger_gesture_id = 0
+        point_history_len = len(pre_processed_point_history_list)
+        if point_history_len == (self.history_length * 2):
+            finger_gesture_id = self.point_history_classifier(
+                pre_processed_point_history_list
+            )
+        
+        # Update finger gesture history for this hand
+        self.finger_gesture_history[hand_label].append(finger_gesture_id)
+        most_common_fg_id = Counter(self.finger_gesture_history[hand_label]).most_common()
+        
+        # Get most common finger gesture
+        if most_common_fg_id:
+            finger_gesture_id = most_common_fg_id[0][0]
+        
+        # Build result object for this hand
+        return HandTrackingResult(
+            hand_detected=True,
+            hand_sign_id=hand_sign_id,
+            hand_sign_label=self.keypoint_classifier_labels[hand_sign_id],
+            finger_gesture_id=finger_gesture_id,
+            finger_gesture_label=self.point_history_classifier_labels[finger_gesture_id],
+            handedness=hand_label,
+            landmark_list=landmark_list,
+            bounding_rect=brect,
+            point_history=list(self.point_history[hand_label]),
+            pre_processed_landmarks=pre_processed_landmark_list,
+            pre_processed_point_history=pre_processed_point_history_list
+        )
+
     
     def _calc_bounding_rect(self, image, landmarks):
         """Calculate bounding rectangle for hand landmarks."""
@@ -366,6 +390,11 @@ class HandTracking:
         )
         
         return temp_point_history
+    
+    def set_primary_hand(self, primary_hand: Handedness):
+        """Set the primary hand to track."""
+        # This method can be expanded to adjust internal logic if needed
+        self.primary_hand = primary_hand
     
     def reset_history(self):
         """Reset point and gesture history for all hands."""

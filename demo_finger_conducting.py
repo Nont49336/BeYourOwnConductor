@@ -225,8 +225,10 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
     
     # Initialize hand tracking
+    primary_hand = Handedness.from_str(args.primary_hand) if args.num_hands > 1 else None
     hand_tracker = HandTracking(
         max_num_hands=args.num_hands,
+        primary_hand=primary_hand,
         min_detection_confidence=0.7,
         min_tracking_confidence=0.5,
         history_length=16
@@ -259,7 +261,6 @@ def main():
     import time
     last_beat_time = 0.0
     beat_position = None  # Position where beat occurred
-    primary_hand = Handedness.from_str(args.primary_hand)
     
     # Get and display pattern information
     pattern_info = conducting_analyzer.get_pattern_info()
@@ -303,8 +304,9 @@ def main():
                 conducting_analyzer.set_time_signature(4)
                 print("\nSwitched to 4/4 time")
             elif key == ord('h'):  # Switch primary hand
-                primary_hand = Handedness.LEFT if primary_hand == Handedness.RIGHT else Handedness.RIGHT
-                print(f"\nSwitched primary hand to: {primary_hand.value}")
+                new_primary_hand = Handedness.LEFT if hand_tracker.primary_hand == Handedness.RIGHT else Handedness.RIGHT
+                hand_tracker.set_primary_hand(new_primary_hand)
+                print(f"\nSwitched primary hand to: {hand_tracker.primary_hand.value}")
             
             # Capture frame
             ret, frame = cap.read()
@@ -319,16 +321,7 @@ def main():
             display_image = copy.deepcopy(frame)
             
             # Process frame with hand tracking
-            hand_results = hand_tracker.process_frame(frame)
-            
-            # Find primary and secondary hand results from the list
-            primary_hand_results = None
-            secondary_hand_results = None
-            for result in hand_results:
-                if result.handedness == primary_hand:
-                    primary_hand_results = result
-                else:
-                    secondary_hand_results = result
+            primary_hand_results, secondary_hand_results = hand_tracker.process_frame(frame)
             
             # Extract positions for both hands
             primary_position = None
@@ -384,10 +377,8 @@ def main():
                 # Only adjust volume if secondary hand is moving (not neutral)
                 if secondary_conducting_frame.direction != Direction.NEUTRAL:
                     # Adjust volume based on secondary hand position (higher = louder)
-                    max_y_pos = 0.8  # Lower bound for volume scaling
-                    min_y_pos = 0.2  # Upper bound for volume scaling
-                    tracked_vol_position = 1.0 - max(min_y_pos, min(max_y_pos, secondary_conducting_frame.position[1]))
-                    vol_level = tracked_vol_position * (2.0 - 0.5) + 0.5  # Scale to 0.5 - 2.0
+                    tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
+                    vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
 
                     if player is not None:
                         if secondary_conducting_frame.position:
