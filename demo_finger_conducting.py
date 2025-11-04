@@ -368,9 +368,11 @@ def main():
                 print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
                       f"tempo {conducting_frame.tempo_estimate} BPM")
                 
-                # Sync MIDI player tempo with conducting tempo
-                if player is not None and player.running and conducting_frame.tempo_estimate:
-                    player.set_bpm(conducting_frame.tempo_estimate)
+                # Play the next beat when a conducting beat is detected
+                if player is not None and player.running:
+                    if conducting_frame.tempo_estimate:
+                        player.set_bpm(conducting_frame.tempo_estimate)
+                    player.play_next_beat()  # Add this method call to play the next beat
             
             # Track sound effects (only from secondary hand)
             if secondary_conducting_frame:

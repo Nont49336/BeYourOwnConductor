@@ -9,7 +9,7 @@ import platform
 class DynamicMidiPlayer:
     """
     A MIDI player with dynamic BPM control using FluidSynth.
-    Allows real-time adjustment of playback tempo in beats per minute.
+    Allows real-time adjustment of playback tempo and beat-by-beat playback.
     """
 
     def __init__(self, soundfont_path: str, bpm: float = 120.0, volume: float = 1.0):
@@ -28,7 +28,12 @@ class DynamicMidiPlayer:
         self.volume = max(0.0, min(2.0, volume))  # Clamp volume between 0.0 and 2.0
         self.running = False
         self.paused = False
-        self.thread = None
+        
+        # Beat and note organization
+        self.current_beat_index = 0  # Track which beat we're on
+        self.beats_per_measure = 4  # Default 4/4 time
+        self.notes_queue = []  # List of (beat_time, note_events) tuples
+        self.active_notes = set()  # Currently playing notes
         
         os_name = platform.system()
         if os_name == "Windows":
@@ -57,6 +62,42 @@ class DynamicMidiPlayer:
         
         print(f"[MIDI] ✓ FluidSynth initialized with soundfont: {os.path.basename(soundfont_path)}")
 
+    def _organize_notes_by_beats(self):
+        """Organize MIDI messages into beats based on timing."""
+        if not self.midi:
+            return
+
+        # Reset queues
+        self.notes_queue = []
+        current_time = 0
+        current_beat_time = 0
+        beat_events = []
+        
+        # Calculate microseconds per beat from BPM
+        microseconds_per_beat = mido.bpm2tempo(self.current_bpm)
+        seconds_per_beat = microseconds_per_beat / 1000000.0
+        
+        # Process all MIDI messages
+        for msg in self.midi:
+            current_time += msg.time
+            
+            # If we've moved to a new beat
+            if current_time >= current_beat_time + seconds_per_beat:
+                if beat_events:
+                    self.notes_queue.append((current_beat_time, beat_events))
+                current_beat_time = current_time
+                beat_events = []
+            
+            # Add message to current beat's events
+            if msg.type in ['note_on', 'note_off', 'program_change', 'control_change', 'pitchwheel']:
+                beat_events.append(msg)
+        
+        # Add any remaining events
+        if beat_events:
+            self.notes_queue.append((current_beat_time, beat_events))
+        
+        print(f"[MIDI] Organized {len(self.notes_queue)} beats of music")
+
     def load_file(self, path: str) -> bool:
         """Load a MIDI file into the player. Returns True if successful."""
         if not os.path.isfile(path):
@@ -80,6 +121,9 @@ class DynamicMidiPlayer:
                 if self.original_tempo != 500000:
                     break
             
+            # Organize notes by beats
+            self._organize_notes_by_beats()
+
             print(f"[MIDI] Loaded file: {os.path.basename(path)} "
                   f"({len(midi.tracks)} tracks, {midi.length:.2f}s)")
             return True
@@ -136,53 +180,61 @@ class DynamicMidiPlayer:
         # If current BPM is lower, we sleep more (play slower)
         return original_bpm / self.current_bpm
 
-    def _playback_loop(self):
-        """Internal playback thread."""
-        if not self.is_file_loaded():
-            print("[Error] No MIDI file loaded. Cannot start playback.")
-            return
-
-        for msg in self.midi.play():
-            if not self.running:
-                break
-            
-            # Check if paused
-            while self.paused and self.running:
-                time.sleep(0.01)  # Small sleep to avoid busy waiting
-            
-            if not self.running:
-                break
-            
-            # Send MIDI messages to FluidSynth
+    def _play_beat_events(self, beat_events):
+        """Play all notes in the given beat events."""
+        # Stop any currently playing notes
+        self._all_notes_off()
+        
+        # Small gap before starting new beat
+        time.sleep(0.02)
+        
+        # Play all notes in this beat simultaneously
+        for msg in beat_events:
             if msg.type == 'note_on':
-                # Apply volume scaling to velocity, clamp to MIDI max (127)
                 adjusted_velocity = min(127, int(msg.velocity * self.volume))
                 self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
+                self.active_notes.add((msg.channel, msg.note))
             elif msg.type == 'note_off':
-                self.fs.noteoff(msg.channel, msg.note)
+                if (msg.channel, msg.note) in self.active_notes:
+                    self.fs.noteoff(msg.channel, msg.note)
+                    self.active_notes.remove((msg.channel, msg.note))
             elif msg.type == 'program_change':
                 self.fs.program_change(msg.channel, msg.program)
             elif msg.type == 'control_change':
                 self.fs.cc(msg.channel, msg.control, msg.value)
             elif msg.type == 'pitchwheel':
                 self.fs.pitch_bend(msg.channel, msg.pitch)
-            
-            # Apply BPM scaling to timing
-            time_scale = self._calculate_time_scaling()
-            time.sleep(msg.time * time_scale)
+
+    def play_next_beat(self):
+        """
+        Play the next beat in the sequence.
+        Returns True if a beat was played, False if we've reached the end.
+        """
+        if not self.running or self.paused:
+            return False
+
+        if self.current_beat_index >= len(self.notes_queue):
+            print("[MIDI] End of piece reached")
+            self.stop()
+            return False
+
+        # Play the current beat
+        _, beat_events = self.notes_queue[self.current_beat_index]
+        self._play_beat_events(beat_events)
         
-        self._all_notes_off()
-        self.running = False  # Mark as finished
-        print("[MIDI] Playback finished.")
+        # Increment beat counter
+        self.current_beat_index += 1
+        return True
 
     def _all_notes_off(self):
         """Send all notes off and all sound off messages to all channels."""
         for channel in range(16):
             self.fs.cc(channel, 123, 0)  # All notes off
             self.fs.cc(channel, 120, 0)  # All sound off
+        self.active_notes.clear()
 
     def start(self):
-        """Start playback in a background thread."""
+        """Prepare for playback but wait for beat-by-beat triggers."""
         if not self.is_file_loaded():
             print("[Error] No MIDI file loaded. Load a file before playing.")
             return
@@ -193,9 +245,8 @@ class DynamicMidiPlayer:
 
         self.running = True
         self.paused = False
-        self.thread = threading.Thread(target=self._playback_loop, daemon=True)
-        self.thread.start()
-        print(f"[MIDI] ▶ Playback started at {self.current_bpm:.1f} BPM: {os.path.basename(self.midi_path)}")
+        self.current_beat_index = 0  # Reset to beginning
+        print(f"[MIDI] ▶ Ready to play at {self.current_bpm:.1f} BPM: {os.path.basename(self.midi_path)}")
 
     def pause(self):
         """Pause playback. Call resume() to continue."""
@@ -222,23 +273,21 @@ class DynamicMidiPlayer:
             return
         
         self.paused = False
-        print(f"[MIDI] ▶ Playback resumed at {self.current_bpm:.1f} BPM.")
+        print(f"[MIDI] ▶ Ready to resume at {self.current_bpm:.1f} BPM.")
 
     def is_paused(self) -> bool:
         """Check if playback is currently paused."""
         return self.paused
 
     def stop(self):
-        """Stop playback gracefully."""
+        """Stop playback."""
         if not self.running:
             return
         
         self.running = False
         self.paused = False
         self._all_notes_off()
-        
-        if self.thread:
-            self.thread.join()
+        self.current_beat_index = 0
         print("[MIDI] ■ Playback stopped.")
 
     def close(self):
