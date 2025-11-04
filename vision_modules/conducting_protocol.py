@@ -591,7 +591,6 @@ class ConductingAnalyzer:
         
         # Normalize displacement (assuming typical max displacement is 0-0.3 of screen)
         # Larger displacement = louder volume
-        print("Max Displacement:", max_displacement)
         normalized_displacement = min(max_displacement / 0.3, 1.0)  # Cap at 1.0
         
         # Scale to volume range [min_volume, max_volume]

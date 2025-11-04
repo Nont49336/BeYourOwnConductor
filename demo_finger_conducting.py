@@ -183,6 +183,97 @@ def draw_pattern_guide(image, conducting_analyzer):
     
     return image
 
+def draw_controls_overlay(image):
+    """Draw controls overlay at the bottom of the screen."""
+    h, w = image.shape[:2]
+    
+    # Create semi-transparent overlay background at the bottom
+    overlay = image.copy()
+    overlay_height = 180
+    overlay_y_start = h - overlay_height
+    cv.rectangle(overlay, (0, overlay_y_start), (w, h), (0, 0, 0), -1)
+    cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+    
+    # Instructions at top of overlay
+    instruction_text = "Press SPACE to start playing and begin conducting!"
+    instruction_size = cv.getTextSize(instruction_text, cv.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    instruction_x = (w - instruction_size[0]) // 2
+    cv.putText(image, instruction_text, (instruction_x, overlay_y_start + 30),
+              cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv.LINE_AA)
+    
+    # Title
+    title_text = "CONTROLS"
+    title_size = cv.getTextSize(title_text, cv.FONT_HERSHEY_SIMPLEX, 1.2, 2)[0]
+    title_x = (w - title_size[0]) // 2
+    cv.putText(image, title_text, (title_x, overlay_y_start + 65),
+              cv.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2, cv.LINE_AA)
+    
+    # Controls list
+    controls = [
+        "SPACE - Start/Pause Music",
+        "2/3/4 - Change Time Signature",
+        "G - Toggle Pattern Guide",
+        "H - Switch Primary Hand",
+        "R - Reset Conducting State",
+        "ESC - Exit"
+    ]
+    
+    # Draw controls in two columns
+    start_y = overlay_y_start + 100
+    line_height = 25
+    col1_x = 50
+    col2_x = w // 2 + 50
+    
+    for i, control in enumerate(controls):
+        if i < 3:
+            x = col1_x
+            y = start_y + i * line_height
+        else:
+            x = col2_x
+            y = start_y + (i - 3) * line_height
+        
+        cv.putText(image, control, (x, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv.LINE_AA)
+    
+    return image
+
+def draw_conducting_path(image, time_signature: int, primary_hand: Handedness):
+    """Draw conducting path based on time signature."""
+    overlay = cv.imread(f'resources/{time_signature}_time_signature_guide.png', cv.IMREAD_UNCHANGED)
+    if overlay is None:
+        return image
+
+    h, w = image.shape[:2]
+    overlay_height = int(h * 0.7) # 70% of window height
+    overlay_width = int(overlay.shape[1] * (overlay_height / overlay.shape[0]))
+    overlay = cv.resize(overlay, (overlay_width, overlay_height))
+
+    if primary_hand == Handedness.LEFT:
+        # Flip overlay for left hand
+        overlay = cv.flip(overlay, 1)
+
+    # Position of overlay
+    y1, y2 = (h - overlay_height) // 2, (h + overlay_height) // 2
+    if primary_hand == Handedness.RIGHT:
+        x1, x2 = w - overlay_width - 50, w - 50
+    else:
+        x1, x2 = 50, 50 + overlay_width
+    
+    # Extract BGR and alpha channels
+    overlay_bgr = overlay[:, :, :3]
+    overlay_alpha = overlay[:, :, 3:4] / 255.0  # Normalize to 0-1
+    
+    # Get the region of interest from the background
+    background_region = image[y1:y2, x1:x2, :3]
+    
+    # Blend using alpha channel
+    blended = overlay_bgr * overlay_alpha + background_region * (1 - overlay_alpha)
+    
+    # Place the blended result back onto the image
+    image[y1:y2, x1:x2, :3] = blended.astype('uint8')
+
+    return image
+
 def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
     """Load MIDI file and SoundFont into the DynamicMidiPlayer."""
     # Check if files exist
@@ -225,10 +316,9 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
     
     # Initialize hand tracking
-    primary_hand = Handedness.from_str(args.primary_hand) if args.num_hands > 1 else None
     hand_tracker = HandTracking(
         max_num_hands=args.num_hands,
-        primary_hand=primary_hand,
+        primary_hand=Handedness.from_str(args.primary_hand),
         min_detection_confidence=0.7,
         min_tracking_confidence=0.5,
         history_length=16
@@ -268,6 +358,7 @@ def main():
     
     # Get and display pattern information
     pattern_info = conducting_analyzer.get_pattern_info()
+    guide_enabled = False
     
     print("Finger Conducting Demo")
     print(f"Time Signature: {pattern_info['time_signature']}")
@@ -307,6 +398,9 @@ def main():
             elif key == ord('4'):  # Switch to 4/4 time
                 conducting_analyzer.set_time_signature(4)
                 print("\nSwitched to 4/4 time")
+            elif key == ord('g'): # Toggle guide
+                guide_enabled = not guide_enabled
+                print(f"\nPattern guide {'enabled' if guide_enabled else 'disabled'}")
             elif key == ord('h'):  # Switch primary hand
                 new_primary_hand = Handedness.LEFT if hand_tracker.primary_hand == Handedness.RIGHT else Handedness.RIGHT
                 hand_tracker.set_primary_hand(new_primary_hand)
@@ -391,6 +485,12 @@ def main():
             
             # Draw pattern guide
             display_image = draw_pattern_guide(display_image, conducting_analyzer)
+            if guide_enabled:
+                display_image = draw_conducting_path(display_image, conducting_analyzer.beats_per_measure, hand_tracker.primary_hand)
+            
+            # Draw controls overlay if music hasn't started yet
+            if not player.running:
+                display_image = draw_controls_overlay(display_image)
             
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
