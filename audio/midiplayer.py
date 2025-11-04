@@ -75,7 +75,8 @@ class DynamicMidiPlayer:
         
         # Calculate microseconds per beat from BPM
         microseconds_per_beat = mido.bpm2tempo(self.current_bpm)
-        seconds_per_beat = microseconds_per_beat / 1000000.0
+        print("⚠️⚠️⚠️   the value is still brute forcing    ⚠️⚠️⚠️")
+        seconds_per_beat = microseconds_per_beat / 2000000.0
         
         # Process all MIDI messages
         for msg in self.midi:
