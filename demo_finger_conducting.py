@@ -41,8 +41,8 @@ def get_args():
                        help='Beats per measure (default: 4 for 4/4 time)')
     parser.add_argument("--primary_hand", type=str, default=Handedness.RIGHT.value,
                        help='Primary conducting hand: "right" or "left" (default: right)')
-    parser.add_argument("--num_hands", type=int, default=2,
-                        help='Maximum number of hands to track (default: 2)')
+    parser.add_argument("--num_hands", type=int, default=1,
+                        help='Maximum number of hands to track (default: 1)')
     
     return parser.parse_args()
 
@@ -240,7 +240,11 @@ def main():
         velocity_smoothing=3,
         tempo_memory=10,
         neutral_velocity_threshold=0.25,  # Higher threshold now that we require duration
-        neutral_duration_threshold=0.5    # Must be below threshold for 0.5s to be neutral
+        neutral_duration_threshold=0.5,   # Must be below threshold for 0.5s to be neutral
+        volume_smoothing=10,              # Smooth volume over frames to prevent rapid changes
+        min_volume=0.5,                   # Minimum volume level
+        max_volume=2.0,                   # Maximum volume level
+        volume_displacement_threshold=0.02,
     )
     conducting_analyzer.set_time_signature(args.time_signature)
 
@@ -372,17 +376,10 @@ def main():
                 if player is not None and player.running and conducting_frame.tempo_estimate:
                     player.set_bpm(conducting_frame.tempo_estimate)
             
-            # Track sound effects (only from secondary hand)
-            if secondary_conducting_frame:
-                # Only adjust volume if secondary hand is moving (not neutral)
-                if secondary_conducting_frame.direction != Direction.NEUTRAL:
-                    # Adjust volume based on secondary hand position (higher = louder)
-                    tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
-                    vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
-
-                    if player is not None:
-                        if secondary_conducting_frame.position:
-                            player.set_volume(vol_level)
+            # Adjust volume based on conducting frame's volume estimate
+            if conducting_frame and conducting_frame.volume_estimate:
+                if player is not None:
+                    player.set_volume(conducting_frame.volume_estimate)
             
             # Draw point history trail with beat highlight
             display_image = draw_point_history(display_image, point_history, beat_position)

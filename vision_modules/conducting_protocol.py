@@ -73,6 +73,9 @@ class ConductingFrame:
     # Tempo information
     tempo_estimate: Optional[float] = None  # BPM
     
+    # Volume information
+    volume_estimate: Optional[float] = None  # Volume level (0.5-1.5 range)
+    
     # Quality metrics
     gesture_energy: float = 0.0  # Magnitude of motion (0-1 normalized)
     
@@ -96,6 +99,7 @@ class ConductingFrame:
             f"vel={self.velocity[0]:.2f},{self.velocity[1]:.2f}, "
             f"dir={self.direction}, phase={self.motion_phase}, "
             f"beat={self.beat_event}, tempo={self.tempo_estimate}, "
+            f"volume={self.volume_estimate}, "
             f"energy={self.gesture_energy:.2f})"
         )
 
@@ -116,7 +120,11 @@ class ConductingAnalyzer:
         tempo_memory: int = 10,
         neutral_velocity_threshold: float = 0.3,  # Velocity below this may indicate neutral (if sustained)
         neutral_duration_threshold: float = 0.5,  # Time (seconds) below threshold to confirm neutral
-        min_beat_interval: float = 0.2  # Minimum 200ms between beats (300 BPM max)
+        min_beat_interval: float = 0.2,  # Minimum 200ms between beats (300 BPM max)
+        volume_smoothing: int = 10,  # Number of frames to smooth volume over
+        min_volume: float = 0.5,  # Minimum volume level
+        max_volume: float = 2.0,  # Maximum volume level
+        volume_displacement_threshold: float = 0.02  # Minimum displacement to adjust volume
     ):
         """
         Initialize the conducting analyzer.
@@ -128,6 +136,10 @@ class ConductingAnalyzer:
             neutral_velocity_threshold: Velocity threshold for potential neutral motion (units/sec)
             neutral_duration_threshold: Time below velocity threshold to confirm neutral (seconds)
             min_beat_interval: Minimum time between beats in seconds
+            volume_smoothing: Number of frames to smooth volume estimates over
+            min_volume: Minimum volume level (default 0.5)
+            max_volume: Maximum volume level (default 1.5)
+            volume_velocity_threshold: # Minimum displacement to adjust volume
         """
         self.history_length = history_length
         self.velocity_smoothing = velocity_smoothing
@@ -135,6 +147,10 @@ class ConductingAnalyzer:
         self.neutral_velocity_threshold = neutral_velocity_threshold
         self.neutral_duration_threshold = neutral_duration_threshold
         self.min_beat_interval = min_beat_interval
+        self.volume_smoothing = volume_smoothing
+        self.min_volume = min_volume
+        self.max_volume = max_volume
+        self.volume_displacement_threshold = volume_displacement_threshold
         
         # History buffers for primary hand
         self.position_history = deque(maxlen=history_length)
@@ -145,6 +161,15 @@ class ConductingAnalyzer:
         self.secondary_position_history = deque(maxlen=history_length)
         self.secondary_velocity_history = deque(maxlen=history_length)
         self.secondary_timestamp_history = deque(maxlen=history_length)
+        
+        # Volume estimation buffers
+        self.volume_history = deque(maxlen=volume_smoothing)
+        self.last_volume_estimate = None
+        
+        # Beat-based displacement tracking for volume
+        # Track position at last beat and maximum displacement since then
+        self.beat_position = None  # Position where last beat occurred
+        self.max_displacement_since_beat = 0.0  # Maximum distance from beat position
         
         # Beat tracking
         self.beat_times = deque(maxlen=tempo_memory)
@@ -264,12 +289,19 @@ class ConductingAnalyzer:
             beat_index = self.current_beat_index
             self.beat_times.append(timestamp)
             self.last_beat_time = timestamp
+            
+            # Reset displacement tracking - new beat position established
+            self.beat_position = position
+            self.max_displacement_since_beat = 0.0
         
         # Determine motion phase
         motion_phase = self._determine_phase(velocity, gesture_energy, timestamp)
         
         # Estimate tempo
         tempo_estimate = self._estimate_tempo()
+        
+        # Estimate volume based on maximum displacement from last beat
+        volume_estimate = self._estimate_volume(position, self.beat_position)
         
         # Create and return conducting frame
         return ConductingFrame(
@@ -281,6 +313,7 @@ class ConductingAnalyzer:
             beat_event=beat_event,
             beat_index=beat_index,
             tempo_estimate=tempo_estimate,
+            volume_estimate=volume_estimate,
             gesture_energy=gesture_energy,
             metadata={'hand': 'primary'}
         )
@@ -520,6 +553,61 @@ class ConductingAnalyzer:
         
         return sum(intervals) / len(intervals)
     
+    def _estimate_volume(
+        self,
+        position: Tuple[float, float],
+        beat_position: Optional[Tuple[float, float]],
+    ) -> tuple[Optional[float], float]:
+        """
+        Estimate volume level based on maximum displacement from last beat position.
+        Measures how far the hand has moved since the last beat was detected.
+        Only considers movement during PRE_BEAT and TRANSITION phases
+        (excludes ON_BEAT and POST_BEAT phases).
+        
+        Args:
+            position: (x, y) current position
+            beat_position: (x, y) position where last beat occurred (or None if no beat yet)
+            
+        Returns:
+            volume_estimate: Estimated volume level (float) or None
+        """
+        # If no beat position yet, can't calculate displacement
+        if beat_position is None:
+            return self.last_volume_estimate
+        
+        # Calculate current displacement from beat position
+        dx = position[0] - beat_position[0]
+        dy = position[1] - beat_position[1]
+        current_displacement = np.sqrt(dx**2 + dy**2)
+        
+        # Update maximum displacement if current is larger
+        max_displacement = max(self.max_displacement_since_beat, current_displacement)
+        self.max_displacement_since_beat = max_displacement
+        
+        # Only adjust volume if there's significant displacement
+        if max_displacement < self.volume_displacement_threshold:
+            # Below threshold, maintain last volume estimate
+            return self.last_volume_estimate
+        
+        # Normalize displacement (assuming typical max displacement is 0-0.3 of screen)
+        # Larger displacement = louder volume
+        print("Max Displacement:", max_displacement)
+        normalized_displacement = min(max_displacement / 0.3, 1.0)  # Cap at 1.0
+        
+        # Scale to volume range [min_volume, max_volume]
+        raw_volume = normalized_displacement * (self.max_volume - self.min_volume) + self.min_volume
+        
+        # Add to volume history for smoothing
+        self.volume_history.append(raw_volume)
+        
+        # Calculate smoothed volume (average of recent estimates)
+        if len(self.volume_history) > 0:
+            smoothed_volume = sum(self.volume_history) / len(self.volume_history)
+            self.last_volume_estimate = smoothed_volume
+            return round(smoothed_volume, 3)
+        
+        return self.last_volume_estimate
+    
     def set_time_signature(self, beats_per_measure: int):
         """
         Set the time signature (beats per measure).
@@ -564,6 +652,12 @@ class ConductingAnalyzer:
         self.beat_times.clear()
         self.last_beat_time = 0.0
         self.current_beat_index = 0
+        
+        # Volume tracking
+        self.volume_history.clear()
+        self.last_volume_estimate = None
+        self.beat_position = None
+        self.max_displacement_since_beat = 0.0
         
         # Direction tracking
         self.last_direction = Direction.NEUTRAL
