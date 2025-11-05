@@ -46,8 +46,8 @@ def get_args():
                         help='Method for volume control: secondary_hand or gesture (default: gesture)')
     parser.add_argument("--velocity_smoothing", type=int, default=4,
                         help='Smoothing factor for velocity calculation (default: 4)')
-    parser.add_argument("--neutral_velocity_threshold", type=float, default=0.4,
-                        help='Neutral velocity threshold for gesture volume control (default: 0.4)')
+    parser.add_argument("--neutral_velocity_threshold", type=float, default=0.24,
+                        help='Neutral velocity threshold for gesture volume control (default: 0.3)')
     parser.add_argument("--history_length", type=int, default=40,
                         help='Length of position history for conducting analysis (default: 40)')
     
@@ -335,7 +335,63 @@ def draw_pattern_guide(image, conducting_analyzer):
     
     return image
 
-def draw_controls_overlay(image):
+def draw_countdown_overlay(image, countdown_beats_detected, countdown_required, calibrated_bpm=None):
+    """Draw countdown overlay showing beat calibration progress."""
+    h, w = image.shape[:2]
+    
+    # Smaller overlay in top-right corner (below velocity graph and above pattern guide)
+    overlay_width = 250
+    overlay_height = 140
+    overlay_x = w - overlay_width - 20
+    overlay_y = 120  # Position below velocity graph
+    padding = 10
+    
+    # Create semi-transparent overlay
+    overlay = image.copy()
+    cv.rectangle(overlay, (overlay_x - padding, overlay_y - padding), 
+                (overlay_x + overlay_width + padding, overlay_y + overlay_height + padding),
+                (0, 0, 0), -1)
+    cv.addWeighted(overlay, 0.5, image, 0.5, 0, image)  # More transparent (50% instead of 80%)
+    
+    # Draw subtle border
+    cv.rectangle(image, (overlay_x - padding, overlay_y - padding), 
+                (overlay_x + overlay_width + padding, overlay_y + overlay_height + padding),
+                (0, 200, 200), 1)
+    
+    # Title - smaller font
+    title_text = "Calibrating"
+    cv.putText(image, title_text, (overlay_x, overlay_y + 20),
+              cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 1, cv.LINE_AA)
+    
+    # Beat counter - smaller and more compact
+    counter_text = f"{countdown_beats_detected} / {countdown_required}"
+    cv.putText(image, counter_text, (overlay_x, overlay_y + 60),
+              cv.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 255), 2, cv.LINE_AA)
+    
+    # Show calibrated BPM if available - smaller font
+    if calibrated_bpm is not None:
+        bpm_text = f"{calibrated_bpm:.1f} BPM"
+        cv.putText(image, bpm_text, (overlay_x, overlay_y + 90),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+    
+    # Draw beat indicators (smaller circles)
+    indicator_y = overlay_y + overlay_height - 20
+    total_width = countdown_required * 30
+    start_x = overlay_x + (overlay_width - total_width) // 2
+    
+    for i in range(countdown_required):
+        x = start_x + i * 30 + 15
+        if i < countdown_beats_detected:
+            # Filled circle for detected beat - smaller
+            cv.circle(image, (x, indicator_y), 8, (0, 255, 0), -1)
+            cv.circle(image, (x, indicator_y), 8, (0, 200, 0), 1)
+        else:
+            # Empty circle for pending beat - smaller
+            cv.circle(image, (x, indicator_y), 8, (80, 80, 80), 1)
+    
+    return image
+
+def draw_controls_overlay(image, waiting_for_conducting=False):
     """Draw controls overlay at the bottom of the screen."""
     h, w = image.shape[:2]
     
@@ -347,11 +403,17 @@ def draw_controls_overlay(image):
     cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
     
     # Instructions at top of overlay
-    instruction_text = "Press SPACE to start playing and begin conducting!"
+    if waiting_for_conducting:
+        instruction_text = "Ready! Start conducting to begin music..."
+        instruction_color = (0, 255, 255)  # Yellow to indicate waiting
+    else:
+        instruction_text = "Press SPACE to start countdown and calibrate tempo!"
+        instruction_color = (0, 255, 0)
+    
     instruction_size = cv.getTextSize(instruction_text, cv.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
     instruction_x = (w - instruction_size[0]) // 2
     cv.putText(image, instruction_text, (instruction_x, overlay_y_start + 30),
-              cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv.LINE_AA)
+              cv.FONT_HERSHEY_SIMPLEX, 0.7, instruction_color, 2, cv.LINE_AA)
     
     # Title
     title_text = "CONTROLS"
@@ -362,7 +424,7 @@ def draw_controls_overlay(image):
     
     # Controls list
     controls = [
-        "SPACE - Start/Pause Music",
+        "SPACE - Start Countdown/Pause",
         "2/3/4 - Change Time Signature",
         "G - Toggle Pattern Guide",
         "H - Switch Primary Hand",
@@ -480,7 +542,7 @@ def main():
     conducting_analyzer = FingerConductingAnalyzer(
         history_length=args.history_length,
         velocity_smoothing=args.velocity_smoothing,
-        tempo_memory=10,
+        tempo_memory=2,
         neutral_velocity_threshold=args.neutral_velocity_threshold,
         neutral_duration_threshold=0.5,   # Must be below threshold for 0.5s to be neutral
         volume_smoothing=10,              # Smooth volume over frames to prevent rapid changes
@@ -511,13 +573,23 @@ def main():
     pattern_info = conducting_analyzer.get_pattern_info()
     guide_enabled = False
     
+    # Waiting for first conducting gesture to start playback
+    waiting_for_conducting = False
+    
+    # Beat countdown state
+    countdown_active = False
+    countdown_beats_detected = 0
+    countdown_required = conducting_analyzer.beats_per_measure
+    countdown_beat_times = []
+    calibrated_bpm = None
+    
     print("Finger Conducting Demo")
     print(f"Time Signature: {pattern_info['time_signature']}")
     print("Beat Detection: Lowest point of downward motion (ictus)")
     print("Press ESC to exit")
     print("Press 'r' to reset conducting state")
     print("Press '2', '3', or '4' to change time signature")
-    print("Press SPACE to Play/Pause music")
+    print(f"Press SPACE to start countdown ({countdown_required} beats to calibrate tempo)")
     print("-" * 50)
 
     try:
@@ -529,8 +601,14 @@ def main():
             elif key == 32:  # SPACE
                 if player is not None:
                     if not player.running:
-                        player.start()
-                        print("Playback started")
+                        # Arm playback - start countdown for tempo calibration
+                        waiting_for_conducting = True
+                        countdown_active = True
+                        countdown_beats_detected = 0
+                        countdown_required = conducting_analyzer.beats_per_measure
+                        countdown_beat_times = []
+                        calibrated_bpm = None
+                        print(f"Countdown started - conduct {countdown_required} beats to calibrate tempo")
                     elif player.is_paused():
                         player.resume()
                         print("Playback resumed")
@@ -539,15 +617,20 @@ def main():
                         print("Playback paused")
             elif key == ord('r'):  # Reset
                 conducting_analyzer.reset()
+                countdown_active = False
+                waiting_for_conducting = False
                 print("Conducting state reset")
             elif key == ord('2'):  # Switch to 2/4 time
                 conducting_analyzer.set_time_signature(2)
+                countdown_required = 2
                 print("\nSwitched to 2/4 time")
             elif key == ord('3'):  # Switch to 3/4 time
                 conducting_analyzer.set_time_signature(3)
+                countdown_required = 3
                 print("\nSwitched to 3/4 time")
             elif key == ord('4'):  # Switch to 4/4 time
                 conducting_analyzer.set_time_signature(4)
+                countdown_required = 4
                 print("\nSwitched to 4/4 time")
             elif key == ord('g'): # Toggle guide
                 guide_enabled = not guide_enabled
@@ -609,6 +692,47 @@ def main():
                 secondary_beat_history.append(secondary_conducting_frame.beat_event == BeatEvent.BEAT)
             else:
                 secondary_beat_history.append(False)
+            
+            # Handle countdown for tempo calibration
+            if countdown_active and conducting_frame:
+                # Check for beat events during countdown
+                if conducting_frame.beat_event:
+                    countdown_beats_detected += 1
+                    countdown_beat_times.append(time.time())
+                    print(f"Countdown beat {countdown_beats_detected}/{countdown_required}")
+                    
+                    # Calculate calibrated BPM from countdown beats
+                    if len(countdown_beat_times) >= 2:
+                        intervals = []
+                        for i in range(1, len(countdown_beat_times)):
+                            intervals.append(countdown_beat_times[i] - countdown_beat_times[i-1])
+                        avg_interval = sum(intervals) / len(intervals)
+                        calibrated_bpm = 60.0 / avg_interval
+                    
+                    # Check if countdown complete
+                    if countdown_beats_detected >= countdown_required:
+                        countdown_active = False
+                        # Start playback with calibrated tempo
+                        if player is not None and calibrated_bpm is not None:
+                            player.set_bpm(calibrated_bpm)
+                            player.start()
+                            waiting_for_conducting = False
+                            print(f"Playback started with calibrated tempo: {calibrated_bpm:.1f} BPM")
+                        else:
+                            # Fallback: just start playback
+                            if player is not None:
+                                player.start()
+                                waiting_for_conducting = False
+                                print("Playback started")
+            
+            # Legacy: Check if waiting for conducting gesture to start playback (no countdown)
+            elif waiting_for_conducting and not countdown_active and conducting_frame:
+                if conducting_frame.direction != Direction.NEUTRAL:
+                    # First non-neutral conducting gesture detected, start playback
+                    if player is not None:
+                        player.start()
+                        waiting_for_conducting = False
+                        print("Playback started (conducting gesture detected)")
             
             # Track beat events (only from primary hand)
             if conducting_frame and conducting_frame.beat_event:
@@ -681,9 +805,14 @@ def main():
             if guide_enabled:
                 display_image = draw_conducting_path(display_image, conducting_analyzer.beats_per_measure, hand_tracker.primary_hand)
             
-            # Draw controls overlay if music hasn't started yet
-            if not player.running:
-                display_image = draw_controls_overlay(display_image)
+            # Draw countdown overlay if active
+            if countdown_active:
+                display_image = draw_countdown_overlay(display_image, countdown_beats_detected, 
+                                                      countdown_required, calibrated_bpm)
+            
+            # Draw controls overlay if music hasn't started yet or waiting for conducting (but not during countdown)
+            elif not player.running or waiting_for_conducting:
+                display_image = draw_controls_overlay(display_image, waiting_for_conducting)
             
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
