@@ -35,6 +35,12 @@ class DynamicMidiPlayer:
         self.notes_queue = []  # List of (beat_time, note_events) tuples
         self.active_notes = set()  # Currently playing notes
         
+        # Multiple track handling
+        self.tracks = []  # List of track information: {'name': str, 'events': list, 'channel': int}
+        self.track_muted = []  # List of boolean values for each track
+        self.track_volumes = []  # List of volume multipliers for each track
+        self.track_solo = []  # List of boolean values for solo mode
+        
         os_name = platform.system()
         if os_name == "Windows":
             driver = "dsound"
@@ -63,41 +69,92 @@ class DynamicMidiPlayer:
         print(f"[MIDI] ✓ FluidSynth initialized with soundfont: {os.path.basename(soundfont_path)}")
 
     def _organize_notes_by_beats(self):
-        """Organize MIDI messages into beats based on timing."""
+        """Organize MIDI messages into beats based on timing, preserving track information."""
         if not self.midi:
             return
 
         # Reset queues
         self.notes_queue = []
-        current_time = 0
-        current_beat_time = 0
-        beat_events = []
+        self.tracks = []
+        self.track_muted = []
+        self.track_volumes = []
+        self.track_solo = []
         
         # Calculate microseconds per beat from BPM
         microseconds_per_beat = mido.bpm2tempo(self.current_bpm)
         print("⚠️⚠️⚠️   the value is still brute forcing    ⚠️⚠️⚠️")
         seconds_per_beat = microseconds_per_beat / 2000000.0
         
-        # Process all MIDI messages
-        for msg in self.midi:
-            current_time += msg.time
+        # Process each track separately
+        active_track_idx = 0  # Index for tracks with notes
+        for original_track_idx, track in enumerate(self.midi.tracks):
+            track_name = track.name if hasattr(track, 'name') and track.name else f"Track {original_track_idx}"
+            track_events_by_beat = {}  # Dictionary mapping beat_index -> list of events
+            current_time = 0
+            has_notes = False  # Flag to check if track has any note events
             
-            # If we've moved to a new beat
-            if current_time >= current_beat_time + seconds_per_beat:
-                if beat_events:
-                    self.notes_queue.append((current_beat_time, beat_events))
-                current_beat_time = current_time
-                beat_events = []
+            # Determine the channel used by this track (default to original_track_idx % 16)
+            track_channel = None
+            for msg in track:
+                if hasattr(msg, 'channel'):
+                    track_channel = msg.channel
+                    break
+            if track_channel is None:
+                track_channel = original_track_idx % 16
             
-            # Add message to current beat's events
-            if msg.type in ['note_on', 'note_off', 'program_change', 'control_change', 'pitchwheel']:
-                beat_events.append(msg)
+            # Process messages in this track
+            for msg in track:
+                current_time += msg.time
+                beat_index = int(current_time / seconds_per_beat)
+                
+                # Check if this track has any note events
+                if msg.type in ['note_on', 'note_off']:
+                    has_notes = True
+                
+                # Add message to the appropriate beat (use active_track_idx for events)
+                if msg.type in ['note_on', 'note_off', 'program_change', 'control_change', 'pitchwheel']:
+                    if beat_index not in track_events_by_beat:
+                        track_events_by_beat[beat_index] = []
+                    track_events_by_beat[beat_index].append((current_time, msg, active_track_idx))
+            
+            # Skip tracks with no note events (metadata-only tracks)
+            if not has_notes:
+                print(f"[MIDI] Skipping track {original_track_idx} '{track_name}' (no note events)")
+                continue
+            
+            # Store track information
+            self.tracks.append({
+                'name': track_name,
+                'events_by_beat': track_events_by_beat,
+                'channel': track_channel,
+                'original_index': original_track_idx
+            })
+            self.track_muted.append(False)
+            self.track_volumes.append(1.0)
+            self.track_solo.append(False)
+            active_track_idx += 1
         
-        # Add any remaining events
-        if beat_events:
-            self.notes_queue.append((current_beat_time, beat_events))
+        # Merge all tracks into a unified beat queue
+        all_beat_indices = set()
+        for track in self.tracks:
+            all_beat_indices.update(track['events_by_beat'].keys())
         
-        print(f"[MIDI] Organized {len(self.notes_queue)} beats of music")
+        # Create a merged beat queue
+        for beat_idx in sorted(all_beat_indices):
+            beat_events = []
+            for track_idx, track in enumerate(self.tracks):
+                if beat_idx in track['events_by_beat']:
+                    for event in track['events_by_beat'][beat_idx]:
+                        beat_events.append(event)  # (time, msg, track_idx)
+            
+            # Sort events within the beat by time
+            beat_events.sort(key=lambda x: x[0])
+            beat_time = beat_idx * seconds_per_beat
+            self.notes_queue.append((beat_time, beat_events))
+        
+        print(f"[MIDI] Organized {len(self.notes_queue)} beats across {len(self.tracks)} tracks")
+        for i, track in enumerate(self.tracks):
+            print(f"  Track {i}: {track['name']} (Channel {track['channel']})")
 
     def load_file(self, path: str) -> bool:
         """Load a MIDI file into the player. Returns True if successful."""
@@ -182,29 +239,70 @@ class DynamicMidiPlayer:
         return original_bpm / self.current_bpm
 
     def _play_beat_events(self, beat_events):
-        """Play all notes in the given beat events."""
-        # Stop any currently playing notes
-        self._all_notes_off()
+        """Play all notes in the given beat events, respecting track mute/solo/volume settings."""
+        # Check if any track is in solo mode
+        any_solo = any(self.track_solo)
         
-        # Small gap before starting new beat
-        time.sleep(0.02)
+        # Collect all note_on events to play simultaneously
+        notes_to_play = []
+        other_events = []
         
-        # Play all notes in this beat simultaneously
-        for msg in beat_events:
-            if msg.type == 'note_on':
-                adjusted_velocity = min(127, int(msg.velocity * self.volume))
-                self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
-                self.active_notes.add((msg.channel, msg.note))
-            elif msg.type == 'note_off':
+        # First pass: organize events by type
+        for event in beat_events:
+            current_time, msg, track_idx = event
+            
+            # Check if this track should be played
+            if track_idx >= len(self.tracks):
+                continue
+            
+            # Skip if track is muted
+            if self.track_muted[track_idx]:
+                continue
+            
+            # If any track is solo, only play solo tracks
+            if any_solo and not self.track_solo[track_idx]:
+                continue
+            
+            # Apply track-specific volume
+            track_volume = self.track_volumes[track_idx]
+            
+            if msg.type == 'note_on' and msg.velocity > 0:
+                # Apply both global volume and track volume
+                combined_volume = self.volume * track_volume
+                adjusted_velocity = min(127, int(msg.velocity * combined_volume))
+                notes_to_play.append((msg.channel, msg.note, adjusted_velocity))
+            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                # Handle note off
                 if (msg.channel, msg.note) in self.active_notes:
-                    self.fs.noteoff(msg.channel, msg.note)
-                    self.active_notes.remove((msg.channel, msg.note))
+                    other_events.append(('note_off', msg.channel, msg.note))
             elif msg.type == 'program_change':
-                self.fs.program_change(msg.channel, msg.program)
+                other_events.append(('program_change', msg.channel, msg.program))
             elif msg.type == 'control_change':
-                self.fs.cc(msg.channel, msg.control, msg.value)
+                other_events.append(('control_change', msg.channel, msg.control, msg.value))
             elif msg.type == 'pitchwheel':
-                self.fs.pitch_bend(msg.channel, msg.pitch)
+                other_events.append(('pitchwheel', msg.channel, msg.pitch))
+        
+        # Process note_off events first
+        for event in other_events:
+            if event[0] == 'note_off':
+                channel, note = event[1], event[2]
+                self.fs.noteoff(channel, note)
+                if (channel, note) in self.active_notes:
+                    self.active_notes.remove((channel, note))
+        
+        # Then play all new notes simultaneously
+        for channel, note, velocity in notes_to_play:
+            self.fs.noteon(channel, note, velocity)
+            self.active_notes.add((channel, note))
+        
+        # Finally, process other events (program changes, etc.)
+        for event in other_events:
+            if event[0] == 'program_change':
+                self.fs.program_change(event[1], event[2])
+            elif event[0] == 'control_change':
+                self.fs.cc(event[1], event[2], event[3])
+            elif event[0] == 'pitchwheel':
+                self.fs.pitch_bend(event[1], event[2])
 
     def play_next_beat(self):
         """
@@ -291,6 +389,71 @@ class DynamicMidiPlayer:
         self.current_beat_index = 0
         print("[MIDI] ■ Playback stopped.")
 
+    # Track-specific controls
+    
+    def get_track_count(self) -> int:
+        """Get the number of tracks in the loaded MIDI file."""
+        return len(self.tracks)
+    
+    def get_track_info(self, track_idx: int) -> dict:
+        """Get information about a specific track."""
+        if 0 <= track_idx < len(self.tracks):
+            return {
+                'name': self.tracks[track_idx]['name'],
+                'channel': self.tracks[track_idx]['channel'],
+                'muted': self.track_muted[track_idx],
+                'volume': self.track_volumes[track_idx],
+                'solo': self.track_solo[track_idx]
+            }
+        return None
+    
+    def list_tracks(self):
+        """Print information about all tracks."""
+        print(f"\n[MIDI] Tracks in {os.path.basename(self.midi_path)}:")
+        for i in range(len(self.tracks)):
+            info = self.get_track_info(i)
+            status = []
+            if info['muted']:
+                status.append("MUTED")
+            if info['solo']:
+                status.append("SOLO")
+            status_str = f" [{', '.join(status)}]" if status else ""
+            print(f"  {i}: {info['name']} (Ch.{info['channel']}, Vol:{info['volume']:.1f}){status_str}")
+    
+    def mute_track(self, track_idx: int, muted: bool = True):
+        """Mute or unmute a specific track."""
+        if 0 <= track_idx < len(self.tracks):
+            self.track_muted[track_idx] = muted
+            status = "muted" if muted else "unmuted"
+            print(f"[MIDI] Track {track_idx} ({self.tracks[track_idx]['name']}) {status}")
+        else:
+            print(f"[Error] Invalid track index: {track_idx}")
+    
+    def solo_track(self, track_idx: int, solo: bool = True):
+        """Solo or unsolo a specific track."""
+        if 0 <= track_idx < len(self.tracks):
+            self.track_solo[track_idx] = solo
+            status = "soloed" if solo else "unsoloed"
+            print(f"[MIDI] Track {track_idx} ({self.tracks[track_idx]['name']}) {status}")
+        else:
+            print(f"[Error] Invalid track index: {track_idx}")
+    
+    def set_track_volume(self, track_idx: int, volume: float):
+        """Set the volume for a specific track (0.0 to 2.0)."""
+        if 0 <= track_idx < len(self.tracks):
+            self.track_volumes[track_idx] = max(0.0, min(2.0, volume))
+            print(f"[MIDI] Track {track_idx} ({self.tracks[track_idx]['name']}) volume set to {volume:.2f}")
+        else:
+            print(f"[Error] Invalid track index: {track_idx}")
+    
+    def reset_all_tracks(self):
+        """Reset all track settings (unmute all, unsolo all, volume to 1.0)."""
+        for i in range(len(self.tracks)):
+            self.track_muted[i] = False
+            self.track_solo[i] = False
+            self.track_volumes[i] = 1.0
+        print("[MIDI] All track settings reset")
+
     def close(self):
         """Close FluidSynth and clean up resources."""
         if self.running:
@@ -310,48 +473,53 @@ if __name__ == "__main__":
         player = DynamicMidiPlayer(soundfont_path=SOUNDFONT_PATH, bpm=120, volume=1.0)
         
         # Load a MIDI file
-        if player.load_file("../ode_to_joy.mid"):
+        if player.load_file("../ouverture.mid"):
+            # Display track information
+            player.list_tracks()
+            
             player.start()
             
-            # Play for 3 seconds at 120 BPM, full volume
-            time.sleep(3)
+            # Play a few beats with all tracks
+            print("\nPlaying with all tracks...")
+            for _ in range(50):
+                player.play_next_beat()
+                time.sleep(0.5)
             
-            # Reduce volume to 50%
-            player.set_volume(0.5)
-            time.sleep(3)
+            # # Mute track 0 and play
+            # if player.get_track_count() > 0:
+            #     print("\nMuting track 0...")
+            #     player.mute_track(0)
+            #     for _ in range(4):
+            #         player.play_next_beat()
+            #         time.sleep(0.5)
             
-            # Pause playback
-            player.pause()
-            print("Paused for 2 seconds...")
-            time.sleep(2)
+            # # Solo track 1 if it exists
+            # if player.get_track_count() > 1:
+            #     print("\nSoloing track 1...")
+            #     player.reset_all_tracks()
+            #     player.solo_track(1)
+            #     for _ in range(4):
+            #         player.play_next_beat()
+            #         time.sleep(0.5)
             
-            # Resume playback at lower volume
-            player.resume()
-            time.sleep(2)
+            # # Reset and adjust track volumes
+            # if player.get_track_count() > 1:
+            #     print("\nAdjusting track volumes...")
+            #     player.reset_all_tracks()
+            #     player.set_track_volume(0, 0.3)  # Track 0 at 30%
+            #     player.set_track_volume(1, 1.5)  # Track 1 at 150%
+            #     for _ in range(4):
+            #         player.play_next_beat()
+            #         time.sleep(0.5)
             
-            # Increase volume to 80%
-            player.set_volume(0.8)
-            time.sleep(3)
+            # # Reset and play normally
+            # print("\nResetting all tracks and playing normally...")
+            # player.reset_all_tracks()
+            # for _ in range(8):
+            #     player.play_next_beat()
+            #     time.sleep(0.5)
             
-            # Speed up to 160 BPM
-            player.set_bpm(160)
-            time.sleep(3)
-            
-            # Very loud (200% volume)
-            player.set_volume(2.0)
-            time.sleep(2)
-            
-            # Pause again
-            player.pause()
-            time.sleep(2)
-            player.resume()
-            
-            # Slow down to 80 BPM and full volume
-            player.set_bpm(80)
-            player.set_volume(1.0)
-            time.sleep(3)
-            
-            player.stop()
+            # player.stop()
         
         player.close()
         
