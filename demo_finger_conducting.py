@@ -27,7 +27,8 @@ def get_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Finger Conducting Demo')
     
-    parser.add_argument("--song_path", type=str, default='ode_to_joy.mid',
+    parser.add_argument("--song_path", type=str, default='autumn.mid',
+    # parser.add_argument("--song_path", type=str, default='ode_to_joy.mid',
                         help='Path to the MIDI file to play (default: ode_to_joy.mid)')
     parser.add_argument("--songfont_path", type=str, default='FluidR3Mono_GM.sf3',
                         help='Path to the SoundFont file (default: FluidR3Mono_GM.sf3)')
@@ -202,8 +203,7 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
         return image
     
     h, w = image.shape[:2]
-    _, track_count = player.get_tracks_with_notes()
-    print("track_count:", track_count)
+    tracks_w_notes, track_count = player.get_tracks_with_notes()
     
     if track_count == 0:
         return image
@@ -238,16 +238,16 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
     column_height = h - column_start_y - 50
     
     # Draw each track column
-    for i in range(track_count):
-        track_info = player.get_track_info(i)
+    for col_idx, track_idx in enumerate(tracks_w_notes):
+        track_info = player.get_track_info(track_idx)
         if track_info is None:
             continue
         
-        # Calculate column position
-        column_x = padding + i * (column_width + padding)
+        # Calculate column position (use col_idx for positioning, not track_idx)
+        column_x = padding + col_idx * (column_width + padding)
         
         # Determine column color based on hover state
-        if hovered_track_idx == i:
+        if hovered_track_idx == track_idx:
             column_color = (100, 150, 255)  # Bright blue when hovered
             border_color = (150, 200, 255)
             border_thickness = 3
@@ -408,15 +408,15 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
         return None
     
     # Calculate column dimensions
-    _, track_count = player.get_tracks_with_notes()
+    tracks_w_notes, track_count = player.get_tracks_with_notes()
     padding = 20
     column_width = (w - padding * (track_count + 1)) // track_count
     
     # Check each track column
-    for i in range(track_count):
-        column_x = padding + i * (column_width + padding)
+    for col_idx, track_idx in enumerate(tracks_w_notes):
+        column_x = padding + col_idx * (column_width + padding)
         if column_x <= hand_x <= column_x + column_width:
-            return i
+            return track_idx
     
     return None
 
