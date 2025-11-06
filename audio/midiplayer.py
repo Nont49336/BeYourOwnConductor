@@ -33,6 +33,10 @@ class DynamicMidiPlayer:
         self.thread = None
         self.fade_thread = None  # Thread for volume fading
         
+        # Multiple track handling
+        self.tracks = []  # List of track information: {'name': str, 'events': list, 'channel': int}
+        self.track_volumes = []  # List of volume multipliers for each track
+        
         os_name = platform.system()
         if os_name == "Windows":
             driver = "dsound"
@@ -60,6 +64,41 @@ class DynamicMidiPlayer:
         
         print(f"[MIDI] ✓ FluidSynth initialized with soundfont: {os.path.basename(soundfont_path)}")
 
+    def _organize_tracks(self):
+        """Organize MIDI tracks and extract track information."""
+        if not self.midi:
+            return
+
+        # Reset track data
+        self.tracks = []
+        self.track_volumes = []
+        
+        # Process each track separately
+        for track_idx, track in enumerate(self.midi.tracks):
+            track_name = track.name if hasattr(track, 'name') and track.name else f"Track {track_idx}"
+            
+            # Determine the channel used by this track (default to track_idx % 16)
+            track_channel = None
+            for msg in track:
+                if hasattr(msg, 'channel'):
+                    track_channel = msg.channel
+                    break
+            if track_channel is None:
+                track_channel = track_idx % 16
+            
+            # Store track information
+            self.tracks.append({
+                'name': track_name,
+                'channel': track_channel,
+                'original_index': track_idx
+            })
+            self.track_volumes.append(1.0)
+        
+        print(f"[MIDI] Organized {len(self.tracks)} tracks")
+        for i, track in enumerate(self.tracks):
+            print(f"  Track {i}: {track['name']} (Channel {track['channel']})")
+
+
     def load_file(self, path: str) -> bool:
         """Load a MIDI file into the player. Returns True if successful."""
         if not os.path.isfile(path):
@@ -82,6 +121,9 @@ class DynamicMidiPlayer:
                         break
                 if self.original_tempo != 500000:
                     break
+            
+            # Organize tracks
+            self._organize_tracks()
             
             print(f"[MIDI] Loaded file: {os.path.basename(path)} "
                   f"({len(midi.tracks)} tracks, {midi.length:.2f}s)")
@@ -142,6 +184,19 @@ class DynamicMidiPlayer:
         # If current BPM is lower, we sleep more (play slower)
         return original_bpm / self.current_bpm
 
+    def _get_track_for_channel(self, channel: int) -> int:
+        """Find the track index that uses this channel (returns first match or -1 if none)."""
+        for i, track in enumerate(self.tracks):
+            if track['channel'] == channel:
+                return i
+        return -1
+
+    def _get_track_volume(self, track_idx: int) -> float:
+        """Get the volume multiplier for a track."""
+        if track_idx < 0 or track_idx >= len(self.tracks):
+            return 1.0  # Unknown track, use full volume
+        return self.track_volumes[track_idx]
+
     def _playback_loop(self):
         """Internal playback thread."""
         if not self.is_file_loaded():
@@ -159,10 +214,19 @@ class DynamicMidiPlayer:
             if not self.running:
                 break
             
+            # Determine which track this message belongs to (if it has a channel)
+            track_idx = -1
+            if hasattr(msg, 'channel'):
+                track_idx = self._get_track_for_channel(msg.channel)
+            
+            # Get track volume multiplier
+            track_volume = self._get_track_volume(track_idx)
+            
             # Send MIDI messages to FluidSynth
             if msg.type == 'note_on':
-                # Apply volume scaling to velocity, clamp to MIDI max (127)
-                adjusted_velocity = min(127, int(msg.velocity * self.volume))
+                # Apply both global volume and track volume to velocity
+                combined_volume = self.volume * track_volume
+                adjusted_velocity = min(127, int(msg.velocity * combined_volume))
                 self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
             elif msg.type == 'note_off':
                 self.fs.noteoff(msg.channel, msg.note)
@@ -291,6 +355,84 @@ class DynamicMidiPlayer:
             self.thread.join()
         print("[MIDI] ■ Playback stopped.")
 
+    # Track-specific controls
+    
+    def get_track_info(self, track_idx: int) -> dict:
+        """
+        Get information about a specific track.
+        
+        Args:
+            track_idx: Index of the track (0-based)
+        
+        Returns:
+            Dictionary with track information:
+            - name: Track name
+            - channel: MIDI channel used by the track
+            - volume: Track volume multiplier (0.0 to 2.0)
+            
+            Returns None if track index is invalid.
+        """
+        if 0 <= track_idx < len(self.tracks):
+            return {
+                'name': self.tracks[track_idx]['name'],
+                'channel': self.tracks[track_idx]['channel'],
+                'volume': self.track_volumes[track_idx]
+            }
+        return None
+    
+    def set_track_volume(self, track_idx: int, volume: float):
+        """
+        Set the volume for a specific track.
+        
+        Args:
+            track_idx: Index of the track (0-based)
+            volume: Volume level (0.0 = silent, 1.0 = full volume, 2.0 = twice full volume)
+        """
+        if 0 <= track_idx < len(self.tracks):
+            self.track_volumes[track_idx] = max(0.0, min(2.0, volume))
+            print(f"[MIDI] Track {track_idx} ({self.tracks[track_idx]['name']}) volume set to {volume:.2f}")
+        else:
+            print(f"[Error] Invalid track index: {track_idx}")
+    
+    def get_tracks_with_notes(self):
+        """
+        Get a list of track indices that contain note events.
+        
+        Returns:
+            Tuple of (list of track indices with notes, count of tracks with notes)
+        """
+        tracks_with_notes = []
+        
+        for i in range(len(self.tracks)):
+            # Check if track has any note events by examining the MIDI file
+            has_notes = False
+            if self.midi and i < len(self.midi.tracks):
+                track = self.midi.tracks[i]
+                for msg in track:
+                    if msg.type in ['note_on', 'note_off']:
+                        has_notes = True
+                        break
+            
+            if has_notes:
+                tracks_with_notes.append(i)
+        
+        return tracks_with_notes, len(tracks_with_notes)
+    
+    def get_track_count(self) -> int:
+        """Get the number of tracks in the loaded MIDI file."""
+        return len(self.tracks)
+    
+    def list_tracks(self):
+        """Print information about all tracks."""
+        if not self.midi_path:
+            print("[MIDI] No file loaded")
+            return
+            
+        print(f"\n[MIDI] Tracks in {os.path.basename(self.midi_path)}:")
+        for i in range(len(self.tracks)):
+            info = self.get_track_info(i)
+            print(f"  {i}: {info['name']} (Ch.{info['channel']}, Vol:{info['volume']:.1f})")
+    
     def close(self):
         """Close FluidSynth and clean up resources."""
         if self.running:
@@ -311,12 +453,29 @@ if __name__ == "__main__":
         
         # Load a MIDI file
         if player.load_file("../ode_to_joy.mid"):
+            # Display track information
+            player.list_tracks()
+            
+            # Get tracks with notes
+            tracks_with_notes, count = player.get_tracks_with_notes()
+            print(f"\n[MIDI] Found {count} tracks with notes: {tracks_with_notes}")
+            
             player.start()
             
             # Play for 3 seconds at 120 BPM, full volume
             time.sleep(3)
             
-            # Reduce volume to 50%
+            # Demonstrate track volume control
+            if player.get_track_count() > 0:
+                print("\n[Demo] Reducing volume of first track...")
+                player.set_track_volume(0, 0.3)
+                time.sleep(3)
+                
+                # Get track info
+                info = player.get_track_info(0)
+                print(f"[Demo] Track 0 info: {info}")
+            
+            # Reduce global volume to 50%
             player.set_volume(0.5)
             time.sleep(3)
             
