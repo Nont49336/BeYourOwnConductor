@@ -27,6 +27,7 @@ def get_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Finger Conducting Demo')
     
+    # parser.add_argument("--song_path", type=str, default='ouverture.mid',
     parser.add_argument("--song_path", type=str, default='ode_to_joy.mid',
                         help='Path to the MIDI file to play (default: ode_to_joy.mid)')
     parser.add_argument("--songfont_path", type=str, default='FluidR3Mono_GM.sf3',
