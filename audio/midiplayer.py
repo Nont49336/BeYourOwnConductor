@@ -464,6 +464,31 @@ class DynamicMidiPlayer:
             status_str = f" [{', '.join(status)}]" if status else ""
             print(f"  {i}: {info['name']} (Ch.{info['channel']}, Vol:{info['volume']:.1f}){status_str}")
     
+    def get_tracks_with_notes(self):
+        """
+        Get a list of track indices that contain note events.
+        Returns a list of track indices that have notes.
+        """
+        tracks_with_notes = []
+        
+        for i in range(len(self.tracks)):
+            # Check if track has any note events
+            has_notes = False
+            events_by_beat = self.tracks[i]['events_by_beat']
+            
+            for beat_idx in events_by_beat:
+                for tick_time, msg, track_idx in events_by_beat[beat_idx]:
+                    if msg.type in ['note_on', 'note_off']:
+                        has_notes = True
+                        break
+                if has_notes:
+                    break
+            
+            if has_notes:
+                tracks_with_notes.append(i)
+        
+        return tracks_with_notes
+    
     def mute_track(self, track_idx: int, muted: bool = True):
         """Mute or unmute a specific track."""
         if 0 <= track_idx < len(self.tracks):
