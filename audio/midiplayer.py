@@ -487,7 +487,7 @@ class DynamicMidiPlayer:
             if has_notes:
                 tracks_with_notes.append(i)
         
-        return tracks_with_notes
+        return tracks_with_notes, len(tracks_with_notes)
     
     def mute_track(self, track_idx: int, muted: bool = True):
         """Mute or unmute a specific track."""
