@@ -1,0 +1,64 @@
+# BeYourOwnConductor Configuration File
+# This file contains default settings for the finger conducting demo
+
+# Camera settings
+camera:
+  device: 0  # Camera device number (usually 0 for default webcam)
+  width: 960  # Camera capture width in pixels
+  height: 540  # Camera capture height in pixels
+  target_fps: 30  # Target frame rate for smoother performance
+
+# Conducting settings
+conducting:
+  time_signature: 4  # Default time signature (2, 3, or 4)
+  initial_bpm: 120.0  # Starting tempo in beats per minute
+
+  # Conducting analysis parameters
+  history_length: 30  # Number of frames to track for analysis
+  velocity_smoothing: 3  # Smoothing factor for velocity calculation
+  tempo_memory: 10  # Number of beats to remember for tempo estimation
+
+  # Neutral detection thresholds
+  neutral_velocity_threshold: 0.25  # Velocity below this is considered stationary
+  neutral_duration_threshold: 0.5  # Seconds hand must be still to be neutral
+
+  # Primary hand preference
+  primary_hand: "right"  # "right" or "left"
+  max_num_hands: 2  # Maximum hands to track (1 or 2)
+
+# Hand tracking settings
+hand_tracking:
+  min_detection_confidence: 0.7  # Confidence threshold for initial detection
+  min_tracking_confidence: 0.5  # Confidence threshold for tracking
+  history_length: 16  # Trail length for visualization
+
+# Audio settings
+audio:
+  song_path: "ode_to_joy.mid"  # Default MIDI file to load
+  soundfont_path: "FluidR3Mono_GM.sf3"  # SoundFont file for audio synthesis
+  initial_volume: 1.0  # Starting volume (0.5 to 1.5 range)
+
+# Visualization settings
+visualization:
+  trail_length: 32  # Length of finger trail in frames
+  beat_flash_duration: 0.5  # How long beat indicator shows (seconds)
+
+  # Colors (BGR format for OpenCV)
+  primary_hand_color: [255, 150, 100]  # Blue for primary hand
+  secondary_hand_color: [100, 150, 255]  # Orange for secondary hand
+
+  # UI settings
+  show_help_on_start: false  # Show help overlay on startup
+  debug_mode_default: false  # Start with debug mode on/off
+  minimal_controls: true  # Show minimal control hints by default
+
+# Performance settings
+performance:
+  frame_rate_limit: true  # Enable 30 FPS limiting for consistent performance
+  skip_frames_if_slow: false  # Drop frames if processing is too slow
+
+# Volume control settings
+volume:
+  min_volume: 0.5  # Minimum volume level
+  max_volume: 1.5  # Maximum volume level
+  volume_change_sensitivity: 2.0  # How sensitive volume control is to hand movement

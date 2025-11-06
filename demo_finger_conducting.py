@@ -7,7 +7,6 @@ Demonstrates using the HandTracking class with the ConductingProtocol
 to perform finger-based music conducting.
 """
 import argparse
-import copy
 import cv2 as cv
 from collections import deque
 import os
@@ -21,6 +20,86 @@ from vision_modules.conducting_protocol import (
     BeatEvent
 )
 from audio.midiplayer import DynamicMidiPlayer
+import time
+import numpy as np
+
+
+def draw_text_with_background(image, text, pos, font_scale=0.8, text_color=(255, 255, 255),
+                               bg_color=(0, 0, 0), bg_alpha=0.6, thickness=1, outline=True):
+    """Draw text with a semi-transparent background for better readability."""
+    font = cv.FONT_HERSHEY_SIMPLEX
+
+    # Get text size
+    (text_width, text_height), baseline = cv.getTextSize(text, font, font_scale, thickness)
+
+    # Calculate background rectangle
+    padding = 8
+    x, y = pos
+    bg_x1 = x - padding
+    bg_y1 = y - text_height - padding
+    bg_x2 = x + text_width + padding
+    bg_y2 = y + baseline + padding
+
+    # Draw semi-transparent background
+    overlay = image.copy()
+    cv.rectangle(overlay, (bg_x1, bg_y1), (bg_x2, bg_y2), bg_color, -1)
+    cv.addWeighted(overlay, bg_alpha, image, 1 - bg_alpha, 0, image)
+
+    # Draw text with optional outline
+    if outline:
+        cv.putText(image, text, pos, font, font_scale, (0, 0, 0), thickness + 2, cv.LINE_AA)
+    cv.putText(image, text, pos, font, font_scale, text_color, thickness, cv.LINE_AA)
+
+    return image
+
+
+def get_velocity_color(velocity, max_velocity=0.5):
+    """Get color based on velocity magnitude (blue -> green -> yellow)."""
+    if max_velocity == 0:
+        return (255, 200, 150)  # Default light blue
+
+    # Normalize velocity to 0-1
+    normalized = min(velocity / max_velocity, 1.0)
+
+    # Create gradient: Blue (slow) -> Green (medium) -> Yellow (fast)
+    if normalized < 0.5:
+        # Blue to Green
+        ratio = normalized * 2
+        b = int(255 * (1 - ratio))
+        g = int(255 * ratio)
+        r = 0
+    else:
+        # Green to Yellow
+        ratio = (normalized - 0.5) * 2
+        b = 0
+        g = 255
+        r = int(255 * ratio)
+
+    return (b, g, r)
+
+
+def calculate_tempo_stability(tempo_history, window=5):
+    """Calculate tempo stability score based on recent tempo estimates."""
+    if len(tempo_history) < 2:
+        return 1.0  # Perfect stability if not enough data
+
+    recent = list(tempo_history)[-window:]
+    if len(recent) < 2:
+        return 1.0
+
+    # Calculate coefficient of variation (std/mean)
+    mean_tempo = np.mean(recent)
+    std_tempo = np.std(recent)
+
+    if mean_tempo == 0:
+        return 0.0
+
+    cv = std_tempo / mean_tempo
+    # Convert to stability score (0 = unstable, 1 = stable)
+    # CV > 0.1 is considered unstable, CV < 0.02 is very stable
+    stability = max(0.0, min(1.0, 1.0 - (cv / 0.1)))
+
+    return stability
 
 
 def get_args():
@@ -47,140 +126,236 @@ def get_args():
     return parser.parse_args()
 
 
-def draw_point_history(image, point_history, beat_position=None):
-    """Draw the trail of finger movement history with optional beat highlight."""
+def draw_point_history(image, point_history, beat_position=None, beat_time=0.0,
+                        velocities=None, hand_color=(255, 150, 100), is_primary=True):
+    """Draw the trail of finger movement history with velocity-based colors and beat highlight."""
+    current_time = time.time()
+    beat_age = current_time - beat_time if beat_time > 0 else 999
+
     for index, point in enumerate(point_history):
         if point[0] != 0 and point[1] != 0:
             # Calculate radius based on age (newer points are larger)
-            radius = 1 + int(index / 2)
-            
-            # Highlight the beat position with a different color
-            if beat_position and abs(point[0] - beat_position[0]) < 5 and abs(point[1] - beat_position[1]) < 5:
-                # Draw bright yellow circle for beat ictus point
-                cv.circle(image, (point[0], point[1]), radius + 3, (0, 255, 255), -1)
-                cv.circle(image, (point[0], point[1]), radius + 3, (0, 200, 255), 2)
+            base_radius = 1 + int(index / 2)
+
+            # Check if this is the beat ictus point
+            is_beat_point = False
+            if beat_position is not None and len(beat_position) >= 2:
+                try:
+                    is_beat_point = (abs(point[0] - beat_position[0]) < 5 and
+                                   abs(point[1] - beat_position[1]) < 5)
+                except (TypeError, IndexError):
+                    is_beat_point = False
+
+            if is_beat_point and beat_age < 0.5:
+                # Pulsing bright magenta for beat ictus (fades over 0.5s)
+                pulse_factor = 1.0 - (beat_age / 0.5)
+                pulse_radius = int(base_radius + 8 * pulse_factor)
+                alpha = int(255 * pulse_factor)
+
+                # Draw pulsing magenta circle
+                cv.circle(image, (point[0], point[1]), pulse_radius, (255, 0, 255), -1)
+                cv.circle(image, (point[0], point[1]), pulse_radius + 2, (255, 100, 255), 2)
             else:
-                # Draw circles with green color that fades
-                cv.circle(image, (point[0], point[1]), radius, (152, 251, 152), 2)
+                # Use velocity-based color if available
+                if velocities and index < len(velocities):
+                    velocity = velocities[index]
+                    color = get_velocity_color(velocity, max_velocity=0.8)
+                else:
+                    # Fallback to hand-specific color with fade
+                    fade = index / len(point_history)
+                    color = tuple(int(c * (0.5 + 0.5 * fade)) for c in hand_color)
+
+                # Draw trail circle
+                thickness = 2 if index > len(point_history) * 0.7 else 1
+                cv.circle(image, (point[0], point[1]), base_radius, color, thickness)
+
     return image
 
 
-def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_time: float = 0.0):
-    """Draw conducting information on the image."""
+def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_time: float = 0.0,
+                         tempo_stability: float = 1.0, hand_label: str = "PRIMARY",
+                         hand_color=(100, 150, 255)):
+    """Draw conducting information on the image with improved layout."""
     h, w = image.shape[:2]
-    
-    # Draw position indicator
+    current_time = time.time()
+
+    # Draw position indicator with hand label
     if conducting_frame.position:
         x = int(conducting_frame.position[0] * w)
         y = int(conducting_frame.position[1] * h)
-        
+
         # Draw crosshair at conducting position
-        color = (0, 255, 0) if conducting_frame.beat_event else (255, 255, 255)
-        thickness = 3 if conducting_frame.beat_event else 1
-        
+        color = hand_color if not conducting_frame.beat_event else (255, 0, 255)
+        thickness = 3 if conducting_frame.beat_event else 2
+
         cv.line(image, (x - 20, y), (x + 20, y), color, thickness)
         cv.line(image, (x, y - 20), (x, y + 20), color, thickness)
-        
+
+        # Draw hand label above crosshair
+        label_y = max(y - 35, 20)
+        draw_text_with_background(image, hand_label, (x - 30, label_y),
+                                 font_scale=0.5, text_color=hand_color,
+                                 bg_alpha=0.7, thickness=1)
+
         # Draw beat indicator circle
         if conducting_frame.beat_event:
-            radius = 30  # Fixed radius for beat indicator
-            cv.circle(image, (x, y), radius, (0, 255, 0), 2)
-    
-    # Draw info panel
+            radius = 30
+            cv.circle(image, (x, y), radius, (255, 0, 255), 3)
+
+    # Full-screen beat flash
+    if beat_display_time > 0 and (current_time - beat_display_time) < 0.5:
+        flash_age = current_time - beat_display_time
+        flash_alpha = 0.3 * (1.0 - flash_age / 0.5)  # Fade from 0.3 to 0
+        overlay = image.copy()
+        cv.rectangle(overlay, (0, 0), (w, h), (255, 255, 255), -1)
+        cv.addWeighted(overlay, flash_alpha, image, 1 - flash_alpha, 0, image)
+
+        # Draw border pulse
+        border_thickness = int(10 * (1.0 - flash_age / 0.5))
+        cv.rectangle(image, (0, 0), (w, h), (255, 0, 255), border_thickness)
+
+        # Beat text display (increased to 0.5s)
+        event_text = "BEAT!"
+        text_size = cv.getTextSize(event_text, cv.FONT_HERSHEY_SIMPLEX, 2.5, 3)[0]
+        text_x = (w - text_size[0]) // 2
+        draw_text_with_background(image, event_text, (text_x, 120),
+                                 font_scale=2.5, text_color=(255, 0, 255),
+                                 bg_alpha=0.8, thickness=3)
+
+    # TOP-LEFT ZONE: Tempo and Beat info
     info_y = 30
     line_height = 35
-    
-    # Tempo
+
+    # Tempo with stability indicator
     if conducting_frame.tempo_estimate:
         tempo_text = f"Tempo: {conducting_frame.tempo_estimate:.1f} BPM"
-        cv.putText(image, tempo_text, (10, info_y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image, tempo_text, (10, info_y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv.LINE_AA)
+
+        # Color-code based on stability
+        if tempo_stability > 0.8:
+            tempo_color = (0, 255, 0)  # Green = stable
+        elif tempo_stability > 0.5:
+            tempo_color = (0, 255, 255)  # Yellow = moderate
+        else:
+            tempo_color = (0, 100, 255)  # Red = unstable
+
+        draw_text_with_background(image, tempo_text, (15, info_y),
+                                 font_scale=0.9, text_color=tempo_color,
+                                 bg_alpha=0.7)
         info_y += line_height
-    
+
     # Beat info
     if conducting_frame.beat_index:
         beat_text = f"Beat: {conducting_frame.beat_index}"
-        cv.putText(image, beat_text, (10, info_y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image, beat_text, (10, info_y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv.LINE_AA)
+        draw_text_with_background(image, beat_text, (15, info_y),
+                                 font_scale=0.9, text_color=(255, 255, 255),
+                                 bg_alpha=0.7)
         info_y += line_height
-    
-    # Direction (vertical only)
-    dir_text = f"Direction: {conducting_frame.direction}"
-    cv.putText(image, dir_text, (10, info_y),
-              cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv.LINE_AA)
-    cv.putText(image, dir_text, (10, info_y),
-              cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv.LINE_AA)
-    info_y += line_height
-    
+
+    # BOTTOM-LEFT ZONE: Motion details
+    bottom_y = h - 120
+
+    # Direction
+    dir_str = conducting_frame.direction.name if conducting_frame.direction else "NEUTRAL"
+    dir_text = f"Direction: {dir_str}"
+    draw_text_with_background(image, dir_text, (15, bottom_y),
+                             font_scale=0.7, text_color=(200, 200, 200),
+                             bg_alpha=0.6)
+    bottom_y += 30
+
     # Motion phase
-    phase_text = f"Phase: {conducting_frame.motion_phase}"
-    cv.putText(image, phase_text, (10, info_y),
-              cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv.LINE_AA)
-    cv.putText(image, phase_text, (10, info_y),
-              cv.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1, cv.LINE_AA)
-    info_y += line_height
-    
-    # Energy bar
-    energy_text = f"Energy: {conducting_frame.gesture_energy:.2f}"
-    bar_length = int(200 * conducting_frame.gesture_energy)
-    cv.rectangle(image, (10, info_y - 20), (10 + bar_length, info_y - 5),
-                (0, 255, 0), -1)
-    cv.rectangle(image, (10, info_y - 20), (210, info_y - 5), (255, 255, 255), 1)
-    cv.putText(image, energy_text, (220, info_y - 5),
-              cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-    info_y += line_height
-    
-    # Beat event display - show for 0.3 seconds after beat
-    import time
-    if beat_display_time > 0 and (time.time() - beat_display_time) < 0.3:
-        event_text = f"BEAT!"
-        cv.putText(image, event_text, (w // 2 - 80, 100),
-                  cv.FONT_HERSHEY_SIMPLEX, 2.0, (0, 0, 0), 6, cv.LINE_AA)
-        cv.putText(image, event_text, (w // 2 - 80, 100),
-                  cv.FONT_HERSHEY_SIMPLEX, 2.0, (0, 255, 0), 3, cv.LINE_AA)
-    
+    phase_str = conducting_frame.motion_phase.name if conducting_frame.motion_phase else "NEUTRAL"
+    phase_text = f"Phase: {phase_str}"
+    draw_text_with_background(image, phase_text, (15, bottom_y),
+                             font_scale=0.7, text_color=(200, 200, 200),
+                             bg_alpha=0.6)
+    bottom_y += 30
+
+    # Energy bar with background
+    energy_value = conducting_frame.gesture_energy if conducting_frame.gesture_energy is not None else 0.0
+    energy_text = f"Energy: {energy_value:.2f}"
+    bar_length = int(180 * min(energy_value, 1.0))
+
+    # Draw energy bar background
+    overlay = image.copy()
+    cv.rectangle(overlay, (10, bottom_y - 25), (220, bottom_y + 5), (0, 0, 0), -1)
+    cv.addWeighted(overlay, 0.6, image, 0.4, 0, image)
+
+    # Draw energy bar
+    if bar_length > 0:
+        energy_color = (0, int(255 * energy_value), 0)
+        cv.rectangle(image, (15, bottom_y - 20), (15 + bar_length, bottom_y), energy_color, -1)
+    cv.rectangle(image, (15, bottom_y - 20), (195, bottom_y), (255, 255, 255), 1)
+
+    cv.putText(image, energy_text, (15, bottom_y - 25),
+              cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+
     return image
 
 
 def draw_pattern_guide(image, conducting_analyzer):
-    """Draw the time signature guide in the corner."""
+    """Draw the time signature guide in the top-right corner."""
     pattern_info = conducting_analyzer.get_pattern_info()
-    
+
     # Position in top-right corner
     h, w = image.shape[:2]
-    start_x = w - 220
-    start_y = 30
-    
-    # Draw background
-    cv.rectangle(image, (start_x - 10, start_y - 25), (w - 10, start_y + 95),
-                (0, 0, 0), -1)
-    cv.rectangle(image, (start_x - 10, start_y - 25), (w - 10, start_y + 95),
-                (255, 255, 255), 1)
+    start_x = w - 230
+    start_y = 35
+
+    # Draw semi-transparent background
+    overlay = image.copy()
+    cv.rectangle(overlay, (start_x - 15, start_y - 30), (w - 10, start_y + 100),
+                (20, 20, 40), -1)
+    cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+    cv.rectangle(image, (start_x - 15, start_y - 30), (w - 10, start_y + 100),
+                (100, 100, 150), 2)
 
     # Draw time signature
     time_sig_text = f"Time: {pattern_info['time_signature']}"
-    cv.putText(image, time_sig_text, (start_x, start_y),
-              cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv.LINE_AA)
-    
-    # Draw current beat indicator
-    beats_text = f"Beat: {conducting_analyzer.current_beat_index}/{conducting_analyzer.beats_per_measure}"
-    color = (0, 255, 0) if conducting_analyzer.current_beat_index > 0 else (200, 200, 200)
-    cv.putText(image, beats_text, (start_x, start_y + 35),
-              cv.FONT_HERSHEY_SIMPLEX, 0.6, color, 1, cv.LINE_AA)
-    
+    draw_text_with_background(image, time_sig_text, (start_x, start_y),
+                             font_scale=0.8, text_color=(255, 255, 150),
+                             bg_alpha=0, thickness=2, outline=False)
+
+    # Draw current beat indicator with visual beat boxes
+    current_beat = conducting_analyzer.current_beat_index
+    total_beats = conducting_analyzer.beats_per_measure
+
+    # Draw beat boxes
+    box_y = start_y + 20
+    box_size = 25
+    box_spacing = 30
+    start_box_x = start_x + 10
+
+    for i in range(1, total_beats + 1):
+        box_x = start_box_x + (i - 1) * box_spacing
+        if i == current_beat:
+            # Current beat - bright and filled
+            cv.rectangle(image, (box_x, box_y), (box_x + box_size, box_y + box_size),
+                        (255, 0, 255), -1)
+            cv.rectangle(image, (box_x, box_y), (box_x + box_size, box_y + box_size),
+                        (255, 150, 255), 2)
+        else:
+            # Other beats - outline only
+            cv.rectangle(image, (box_x, box_y), (box_x + box_size, box_y + box_size),
+                        (150, 150, 150), 2)
+
+        # Beat number
+        num_text = str(i)
+        text_size = cv.getTextSize(num_text, cv.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+        text_x = box_x + (box_size - text_size[0]) // 2
+        text_y = box_y + box_size // 2 + text_size[1] // 2
+        cv.putText(image, num_text, (text_x, text_y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
+
     # Draw beat detection explanation
+    info_y = box_y + box_size + 25
     info_text = "Beat at lowest point"
-    cv.putText(image, info_text, (start_x, start_y + 60),
-              cv.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv.LINE_AA)
-    
-    down_up_text = "(DOWN -> UP transition)"
-    cv.putText(image, down_up_text, (start_x, start_y + 80),
-              cv.FONT_HERSHEY_SIMPLEX, 0.4, (150, 150, 150), 1, cv.LINE_AA)
-    
+    cv.putText(image, info_text, (start_x, info_y),
+              cv.FONT_HERSHEY_SIMPLEX, 0.45, (200, 220, 200), 1, cv.LINE_AA)
+
+    down_up_text = "(DOWN \u2192 UP)"
+    cv.putText(image, down_up_text, (start_x, info_y + 18),
+              cv.FONT_HERSHEY_SIMPLEX, 0.4, (180, 180, 180), 1, cv.LINE_AA)
+
     return image
 
 
@@ -203,14 +378,13 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
     
     h, w = image.shape[:2]
     _, track_count = player.get_tracks_with_notes()
-    print("track_count:", track_count)
-    
+
     if track_count == 0:
         return image
     
     # Create a translucent overlay
     overlay = image.copy()
-    alpha = 0.7  # Transparency level (0.0 = fully transparent, 1.0 = opaque)
+    alpha = 0.5  # Transparency level (reduced for better hand visibility)
     
     # Draw semi-transparent background covering the whole screen
     cv.rectangle(overlay, (0, 0), (w, h), (40, 40, 40), -1)
@@ -420,6 +594,141 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
     
     return None
 
+
+def draw_volume_indicator(image, volume: float, player_running: bool = False):
+    """Draw global volume level indicator in top-center."""
+    h, w = image.shape[:2]
+
+    # Position at top-center
+    bar_width = 150
+    bar_height = 20
+    x = (w - bar_width) // 2
+    y = 15
+
+    # Draw background
+    overlay = image.copy()
+    cv.rectangle(overlay, (x - 10, y - 5), (x + bar_width + 10, y + bar_height + 5),
+                (0, 0, 0), -1)
+    cv.addWeighted(overlay, 0.6, image, 0.4, 0, image)
+
+    # Draw volume bar background
+    cv.rectangle(image, (x, y), (x + bar_width, y + bar_height), (50, 50, 50), -1)
+    cv.rectangle(image, (x, y), (x + bar_width, y + bar_height), (150, 150, 150), 1)
+
+    # Draw filled portion (volume ranges from 0.5 to 1.5, map to bar)
+    normalized_vol = (volume - 0.5) / (1.5 - 0.5)
+    filled_width = int(bar_width * normalized_vol)
+
+    # Color based on volume level
+    if volume > 1.2:
+        vol_color = (0, 150, 255)  # Orange for high
+    elif volume > 0.8:
+        vol_color = (0, 255, 0)  # Green for normal
+    else:
+        vol_color = (150, 150, 0)  # Cyan for low
+
+    if filled_width > 0:
+        cv.rectangle(image, (x, y), (x + filled_width, y + bar_height), vol_color, -1)
+
+    # Draw center line (100% reference)
+    center_x = x + bar_width // 2
+    cv.line(image, (center_x, y), (center_x, y + bar_height), (200, 200, 200), 1)
+
+    # Draw volume text
+    vol_text = f"Vol: {int(volume * 100)}%"
+    text_size = cv.getTextSize(vol_text, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+    text_x = x + (bar_width - text_size[0]) // 2
+    text_y = y - 8
+    cv.putText(image, vol_text, (text_x, text_y),
+              cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+
+    # Show playback status
+    if player_running:
+        status_indicator = "\u25B6"  # Play symbol
+        cv.putText(image, status_indicator, (x - 25, y + 16),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv.LINE_AA)
+
+    return image
+
+
+def draw_control_hints(image, show_minimal: bool = True):
+    """Draw control hints at the bottom of the screen."""
+    h, w = image.shape[:2]
+
+    if show_minimal:
+        # Minimal hints - just essential controls
+        hints = "SPACE: Play/Pause  |  ESC: Exit  |  H: Help"
+        y = h - 20
+
+        # Draw background
+        text_size = cv.getTextSize(hints, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+        x = (w - text_size[0]) // 2
+
+        overlay = image.copy()
+        cv.rectangle(overlay, (x - 10, y - 20), (x + text_size[0] + 10, y + 5),
+                    (0, 0, 0), -1)
+        cv.addWeighted(overlay, 0.6, image, 0.4, 0, image)
+
+        cv.putText(image, hints, (x, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv.LINE_AA)
+    else:
+        # Full help overlay
+        help_lines = [
+            "KEYBOARD CONTROLS",
+            "",
+            "SPACE   - Play/Pause music",
+            "ESC     - Exit application",
+            "R       - Reset conducting state",
+            "2/3/4   - Change time signature",
+            "H       - Switch primary hand",
+            "D       - Toggle debug info",
+            "",
+            "HAND GESTURES",
+            "Primary Hand:   Control tempo & beats",
+            "Secondary Hand: Adjust volume (open)",
+            "                Track control (pointer)",
+        ]
+
+        # Draw semi-transparent background
+        overlay = image.copy()
+        panel_w = 500
+        panel_h = 380
+        panel_x = (w - panel_w) // 2
+        panel_y = (h - panel_h) // 2
+
+        cv.rectangle(overlay, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h),
+                    (20, 20, 40), -1)
+        cv.addWeighted(overlay, 0.9, image, 0.1, 0, image)
+        cv.rectangle(image, (panel_x, panel_y), (panel_x + panel_w, panel_y + panel_h),
+                    (100, 150, 255), 3)
+
+        # Draw title
+        title = "HELP - Press H to close"
+        title_size = cv.getTextSize(title, cv.FONT_HERSHEY_SIMPLEX, 0.9, 2)[0]
+        title_x = panel_x + (panel_w - title_size[0]) // 2
+        cv.putText(image, title, (title_x, panel_y + 40),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.9, (255, 255, 150), 2, cv.LINE_AA)
+
+        # Draw help text
+        text_y = panel_y + 80
+        line_height = 25
+
+        for line in help_lines:
+            if line == "" or line.isupper():
+                # Section header or blank line
+                if line.isupper():
+                    cv.putText(image, line, (panel_x + 30, text_y),
+                              cv.FONT_HERSHEY_SIMPLEX, 0.6, (150, 200, 255), 2, cv.LINE_AA)
+                text_y += line_height
+            else:
+                # Regular line
+                cv.putText(image, line, (panel_x + 40, text_y),
+                          cv.FONT_HERSHEY_SIMPLEX, 0.5, (220, 220, 220), 1, cv.LINE_AA)
+                text_y += line_height
+
+    return image
+
+
 def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
     """Load MIDI file and SoundFont into the DynamicMidiPlayer."""
     # Check if files exist
@@ -455,12 +764,22 @@ def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
 def main():
     """Main application loop."""
     args = get_args()
-    
+
+    # Mouse click handling state
+    mouse_click_track = None
+
+    def mouse_callback(event, x, y, flags, param):
+        """Handle mouse clicks for track selection."""
+        nonlocal mouse_click_track
+        if event == cv.EVENT_LBUTTONDOWN:
+            # Store click position to be processed in main loop
+            mouse_click_track = (x, y)
+
     # Initialize camera
     cap = cv.VideoCapture(args.device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
-    
+
     # Initialize hand tracking
     primary_hand = Handedness.from_str(args.primary_hand) if args.num_hands > 1 else None
     hand_tracker = HandTracking(
@@ -470,7 +789,7 @@ def main():
         min_tracking_confidence=0.5,
         history_length=16
     )
-    
+
     # Initialize conducting analyzer with improved neutral detection
     conducting_analyzer = FingerConductingAnalyzer(
         history_length=30,
@@ -488,42 +807,66 @@ def main():
         soundfont_path=args.songfont_path,
         initial_bpm=INITIAL_BPM
     )
-    
+
     # Initialize point history for trail visualization
     history_length = 32  # Length of the trail
     point_history = deque(maxlen=history_length)
     secondary_point_history = deque(maxlen=history_length)
-    
+
     # Beat display tracking
-    import time
     last_beat_time = 0.0
     beat_position = None  # Position where beat occurred
-    
+
     # Track volume control state
     last_hovered_track = None
     last_pointer_y_position = None  # Track last Y position for delta calculation
+
+    # Tempo stability tracking
+    tempo_history = deque(maxlen=10)
+
+    # FPS and timing
+    frame_times = deque(maxlen=30)
+    last_frame_time = time.time()
+    target_fps = 30
+    frame_time = 1.0 / target_fps
+
+    # UI state
+    debug_mode = False
+    show_help = False
+    current_volume = 1.0
     
     # Get and display pattern information
     pattern_info = conducting_analyzer.get_pattern_info()
-    
-    print("Finger Conducting Demo")
-    print(f"Time Signature: {pattern_info['time_signature']}")
-    print("Beat Detection: Lowest point of downward motion (ictus)")
-    print("\nControls:")
-    print("  ESC     - Exit")
+
+    print("\n" + "=" * 70)
+    print("  FINGER CONDUCTING DEMO")
+    print("=" * 70)
+    print(f"\nTime Signature: {pattern_info['time_signature']}")
+    print(f"MIDI File: {args.song_path}")
+    print(f"Initial BPM: {INITIAL_BPM}")
+    print("\n" + "-" * 70)
+    print("CONTROLS:")
     print("  SPACE   - Play/Pause music")
-    print("  'r'     - Reset conducting state")
-    print("  '2/3/4' - Change time signature to 2/4, 3/4, or 4/4")
-    print("  'h'     - Switch primary hand")
-    print("\nConducting:")
-    print("  Primary Hand   - Controls tempo and beats")
-    print("  Secondary Hand - Normal: Adjust global volume (all tracks)")
-    print("                   Pointer Gesture: Show track overlay + adjust individual tracks")
-    print("                   Move hand UP/DOWN to increase/decrease volume")
-    print("-" * 70)
+    print("  ESC     - Exit")
+    print("  H       - Toggle help overlay / Switch primary hand")
+    print("  D       - Toggle debug mode")
+    print("  R       - Reset conducting state")
+    print("  2/3/4   - Change time signature")
+    print("\nCONDUCTING:")
+    print("  Primary Hand   - Controls tempo and beats (shown in BLUE)")
+    print("  Secondary Hand - Global volume (open) or track control (pointer)")
+    print("                   Shown in ORANGE")
+    print("\nPress H in the application for detailed help.")
+    print("=" * 70 + "\n")
+
+    # Set up window and mouse callback
+    window_name = 'Finger Conducting'
+    cv.namedWindow(window_name)
+    cv.setMouseCallback(window_name, mouse_callback)
 
     try:
         while True:
+            frame_start = time.time()
             # Check for keys
             key = cv.waitKey(1)
             if key == 27:  # ESC
@@ -532,42 +875,50 @@ def main():
                 if player is not None:
                     if not player.running:
                         player.start()
-                        print("Playback started")
+                        print("▶ Playback started")
                     elif player.is_paused():
                         player.resume()
-                        print("Playback resumed")
+                        print("▶ Playback resumed")
                     else:
                         player.pause()
-                        print("Playback paused")
+                        print("⏸ Playback paused")
             elif key == ord('r'):  # Reset
                 conducting_analyzer.reset()
-                print("Conducting state reset")
+                tempo_history.clear()
+                print("🔄 Conducting state reset")
             elif key == ord('2'):  # Switch to 2/4 time
                 conducting_analyzer.set_time_signature(2)
-                print("\nSwitched to 2/4 time")
+                print("♪ Switched to 2/4 time")
             elif key == ord('3'):  # Switch to 3/4 time
                 conducting_analyzer.set_time_signature(3)
-                print("\nSwitched to 3/4 time")
+                print("♪ Switched to 3/4 time")
             elif key == ord('4'):  # Switch to 4/4 time
                 conducting_analyzer.set_time_signature(4)
-                print("\nSwitched to 4/4 time")
-            elif key == ord('h'):  # Switch primary hand
+                print("♪ Switched to 4/4 time")
+            elif key == ord('h') or key == ord('H'):  # Toggle help or switch hand
+                if show_help:
+                    show_help = False
+                else:
+                    show_help = True
+            elif key == ord('d') or key == ord('D'):  # Toggle debug mode
+                debug_mode = not debug_mode
+                print(f"🔧 Debug mode: {'ON' if debug_mode else 'OFF'}")
+            elif key == ord('p'):  # Alternative: switch primary hand with 'p'
                 new_primary_hand = Handedness.LEFT if hand_tracker.primary_hand == Handedness.RIGHT else Handedness.RIGHT
                 hand_tracker.set_primary_hand(new_primary_hand)
-                print(f"\nSwitched primary hand to: {hand_tracker.primary_hand.value}")
+                print(f"👋 Switched primary hand to: {hand_tracker.primary_hand.value}")
             
             # Capture frame
             ret, frame = cap.read()
             if not ret:
                 print("Failed to capture frame")
                 break
-            
-            # Mirror the frame
+
+            # Mirror the frame (MUST be done before hand tracking)
             frame = cv.flip(frame, 1)
-            
-            # Create display image
-            display_image = copy.deepcopy(frame)
-            
+            # Use frame directly for display (no deep copy needed)
+            display_image = frame
+
             # Process frame with hand tracking
             primary_hand_results, secondary_hand_results = hand_tracker.process_frame(frame)
             
@@ -612,15 +963,27 @@ def main():
                 last_beat_time = time.time()
                 # Get beat position from primary hand for trail highlight
                 if primary_hand_results and len(primary_hand_results.landmark_list) > 8:
-                    beat_position = primary_hand_results.landmark_list[8]
-                print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
-                      f"tempo {conducting_frame.tempo_estimate} BPM")
-                
+                    try:
+                        beat_position = primary_hand_results.landmark_list[8]
+                    except (IndexError, TypeError):
+                        beat_position = None
+
+                # Track tempo for stability calculation
+                if conducting_frame.tempo_estimate and conducting_frame.tempo_estimate > 0:
+                    tempo_history.append(conducting_frame.tempo_estimate)
+
+                tempo_str = f"{conducting_frame.tempo_estimate:.1f}" if conducting_frame.tempo_estimate else "N/A"
+                print(f"🎵 Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
+                      f"tempo {tempo_str} BPM")
+
                 # Play the next beat when a conducting beat is detected
                 if player is not None and player.running:
-                    if conducting_frame.tempo_estimate:
-                        player.set_bpm(conducting_frame.tempo_estimate)
-                    player.play_next_beat()  # Add this method call to play the next beat
+                    try:
+                        if conducting_frame.tempo_estimate and conducting_frame.tempo_estimate > 0:
+                            player.set_bpm(conducting_frame.tempo_estimate)
+                        player.play_next_beat()
+                    except Exception as e:
+                        print(f"⚠️  Audio playback error: {e}")
             
             # Track volume control with secondary hand
             is_pointer_mode = False
@@ -690,30 +1053,109 @@ def main():
                         # Reset pointer mode tracking when exiting pointer mode
                         last_hovered_track = None
                         last_pointer_y_position = None
-                        
+
                         if secondary_conducting_frame.direction != Direction.NEUTRAL:
                             # Calculate volume level from hand position
                             tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
                             vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
                             player.set_volume(vol_level)
-            
+                            current_volume = vol_level
+
+            # Handle mouse clicks for track selection
+            if mouse_click_track is not None and is_pointer_mode:
+                clicked_track = get_hovered_track_in_overlay(player, mouse_click_track, display_image.shape)
+                if clicked_track is not None:
+                    print(f"🖱️  Clicked track {clicked_track}")
+                mouse_click_track = None
+
+            # Calculate tempo stability for visualization
+            tempo_stability = calculate_tempo_stability(tempo_history)
+
+            # Define hand colors (BGR format)
+            primary_color = (255, 150, 100)  # Blue (high B, medium G, low R)
+            secondary_color = (0, 150, 255)  # Orange (low B, medium G, high R)
+
             # Draw point history trail with beat highlight
-            display_image = draw_point_history(display_image, point_history, beat_position)
-            display_image = draw_point_history(display_image, secondary_point_history)
-            
-            # Draw conducting visualization
+            display_image = draw_point_history(display_image, point_history,
+                                               beat_position=beat_position,
+                                               beat_time=last_beat_time,
+                                               hand_color=primary_color,
+                                               is_primary=True)
+            display_image = draw_point_history(display_image, secondary_point_history,
+                                               beat_position=None,
+                                               beat_time=0.0,
+                                               hand_color=secondary_color,
+                                               is_primary=False)
+
+            # Draw conducting visualization with tempo stability
             if conducting_frame:
-                display_image = draw_conducting_info(display_image, conducting_frame, last_beat_time)
-            
+                display_image = draw_conducting_info(display_image, conducting_frame, last_beat_time,
+                                                    tempo_stability, "PRIMARY", primary_color)
+
+            # Draw secondary hand indicator if present
+            if secondary_conducting_frame and secondary_conducting_frame.position:
+                h, w = display_image.shape[:2]
+                x = int(secondary_conducting_frame.position[0] * w)
+                y = int(secondary_conducting_frame.position[1] * h)
+
+                # Draw crosshair for secondary hand
+                cv.line(display_image, (x - 15, y), (x + 15, y), secondary_color, 2)
+                cv.line(display_image, (x, y - 15), (x, y + 15), secondary_color, 2)
+
+                # Draw label
+                label_y = max(y - 30, 20)
+                draw_text_with_background(display_image, "SECONDARY", (x - 35, label_y),
+                                         font_scale=0.5, text_color=secondary_color,
+                                         bg_alpha=0.7, thickness=1)
+
             # Draw pattern guide
             display_image = draw_pattern_guide(display_image, conducting_analyzer)
-            
+
+            # Draw volume indicator (always visible)
+            if player is not None:
+                display_image = draw_volume_indicator(display_image, current_volume,
+                                                     player.running and not player.is_paused())
+
             # Draw track selection overlay if in pointer mode
             if is_pointer_mode:
                 display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, hovered_track_idx)
-            
+
+            # Draw control hints or help overlay
+            if show_help:
+                display_image = draw_control_hints(display_image, show_minimal=False)
+            else:
+                display_image = draw_control_hints(display_image, show_minimal=True)
+
+            # Draw debug info if enabled
+            if debug_mode:
+                # Calculate FPS
+                frame_times.append(time.time())
+                if len(frame_times) > 1:
+                    fps = len(frame_times) / (frame_times[-1] - frame_times[0])
+                else:
+                    fps = 0
+
+                debug_y = 150
+                debug_text = [
+                    f"FPS: {fps:.1f}",
+                    f"Tempo Stability: {tempo_stability:.2f}",
+                    f"Frame Times: {len(frame_times)}",
+                ]
+
+                for text in debug_text:
+                    draw_text_with_background(display_image, text, (15, debug_y),
+                                             font_scale=0.6, text_color=(255, 255, 0),
+                                             bg_alpha=0.7)
+                    debug_y += 25
+
+            # Frame rate limiting
+            frame_elapsed = time.time() - frame_start
+            sleep_time = max(0, frame_time - frame_elapsed)
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
             # Display the frame
-            cv.imshow('Finger Conducting', display_image)
+            cv.imshow(window_name, display_image)
     
     finally:
         # Clean up
