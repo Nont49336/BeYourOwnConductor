@@ -42,8 +42,6 @@ def get_args():
                        help='Primary conducting hand: "right" or "left" (default: right)')
     parser.add_argument("--num_hands", type=int, default=2,
                         help='Maximum number of hands to track (default: 2)')
-    parser.add_argument("--volume_control", type=str, choices=['secondary_hand', 'gesture'], default='gesture',
-                        help='Method for volume control: secondary_hand or gesture (default: gesture)')
     parser.add_argument("--velocity_smoothing", type=int, default=4,
                         help='Smoothing factor for velocity calculation (default: 4)')
     parser.add_argument("--neutral_velocity_threshold", type=float, default=0.24,
@@ -760,26 +758,19 @@ def main():
                             print("Music resumed")
             
             # Adjust volume
-            # SECONDARY HAND - Based on secondary hand's vertical position
-            if args.volume_control == 'secondary_hand':
-                # Track sound effects (only from secondary hand)
-                if secondary_conducting_frame:
-                    # Only adjust volume if secondary hand is moving (not neutral)
-                    if secondary_conducting_frame.direction != Direction.NEUTRAL:
-                        # Adjust volume based on secondary hand position (higher = louder)
-                        tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
-                        vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
+            # Based on secondary hand's vertical position
+            # Track sound effects (only from secondary hand)
+            if secondary_conducting_frame:
+                # Only adjust volume if secondary hand is moving (not neutral)
+                if secondary_conducting_frame.direction != Direction.NEUTRAL:
+                    # Adjust volume based on secondary hand position (higher = louder)
+                    tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
+                    vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
 
-                        if player is not None:
-                            if secondary_conducting_frame.position:
-                                player.set_volume(vol_level)
-
-            # GESTURE - Based on conducting frame's volume estimate
-            elif args.volume_control == 'gesture':
-                if conducting_frame and conducting_frame.volume_estimate:
                     if player is not None:
-                        player.set_volume(conducting_frame.volume_estimate)
-            
+                        if secondary_conducting_frame.position:
+                            player.set_volume(vol_level)
+
             # Draw point history trail with beat highlight (green circles for smoothed positions, yellow for beats)
             if conducting_frame:
                 display_image = draw_point_history(display_image, conducting_frame, list(primary_beat_history), args.velocity_smoothing, args.history_length)
