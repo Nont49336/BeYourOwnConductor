@@ -391,7 +391,7 @@ class HandTracking:
         
         return temp_point_history
     
-    def set_primary_hand(self, primary_hand: Handedness):
+    def set_primary_hand(self, primary_hand: Optional[Handedness]):
         """Set the primary hand to track."""
         # This method can be expanded to adjust internal logic if needed
         self.primary_hand = primary_hand

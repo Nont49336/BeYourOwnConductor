@@ -73,6 +73,9 @@ class ConductingFrame:
     # Tempo information
     tempo_estimate: Optional[float] = None  # BPM
     
+    # Volume information
+    volume_estimate: Optional[float] = None  # Volume level (0.5-1.5 range)
+    
     # Quality metrics
     gesture_energy: float = 0.0  # Magnitude of motion (0-1 normalized)
     
@@ -96,6 +99,7 @@ class ConductingFrame:
             f"vel={self.velocity[0]:.2f},{self.velocity[1]:.2f}, "
             f"dir={self.direction}, phase={self.motion_phase}, "
             f"beat={self.beat_event}, tempo={self.tempo_estimate}, "
+            f"volume={self.volume_estimate}, "
             f"energy={self.gesture_energy:.2f})"
         )
 
@@ -112,50 +116,82 @@ class ConductingAnalyzer:
     def __init__(
         self,
         history_length: int = 30,
+        position_smoothing_alpha: float = 0.3,  # EMA alpha for position smoothing (0-1, higher = more responsive)
         velocity_smoothing: int = 3,
         tempo_memory: int = 10,
         neutral_velocity_threshold: float = 0.3,  # Velocity below this may indicate neutral (if sustained)
         neutral_duration_threshold: float = 0.5,  # Time (seconds) below threshold to confirm neutral
-        min_beat_interval: float = 0.2  # Minimum 200ms between beats (300 BPM max)
+        min_beat_interval: float = 0.2,  # Minimum 200ms between beats (300 BPM max)
+        volume_smoothing: int = 10,  # Number of frames to smooth volume over
+        min_volume: float = 0.5,  # Minimum volume level
+        max_volume: float = 2.0,  # Maximum volume level
+        volume_displacement_threshold: float = 0.02  # Minimum displacement to adjust volume
     ):
         """
         Initialize the conducting analyzer.
         
         Args:
             history_length: Number of frames to keep in position history
+            position_smoothing_alpha: EMA alpha for position smoothing (0-1, higher = more responsive, reduces jitter)
             velocity_smoothing: Number of frames to smooth velocity over
             tempo_memory: Number of beats to use for tempo estimation
             neutral_velocity_threshold: Velocity threshold for potential neutral motion (units/sec)
             neutral_duration_threshold: Time below velocity threshold to confirm neutral (seconds)
             min_beat_interval: Minimum time between beats in seconds
+            volume_smoothing: Number of frames to smooth volume estimates over
+            min_volume: Minimum volume level (default 0.5)
+            max_volume: Maximum volume level (default 1.5)
+            volume_velocity_threshold: # Minimum displacement to adjust volume
         """
         self.history_length = history_length
+        self.position_smoothing_alpha = position_smoothing_alpha
         self.velocity_smoothing = velocity_smoothing
         self.tempo_memory = tempo_memory
         self.neutral_velocity_threshold = neutral_velocity_threshold
         self.neutral_duration_threshold = neutral_duration_threshold
         self.min_beat_interval = min_beat_interval
+        self.volume_smoothing = volume_smoothing
+        self.min_volume = min_volume
+        self.max_volume = max_volume
+        self.volume_displacement_threshold = volume_displacement_threshold
         
         # History buffers for primary hand
         self.position_history = deque(maxlen=history_length)
         self.velocity_history = deque(maxlen=history_length)
         self.timestamp_history = deque(maxlen=history_length)
         
+        # EMA smoothed position tracking
+        self.smoothed_position = None  # Current EMA smoothed position for primary hand
+        
         # History buffers for secondary hand
         self.secondary_position_history = deque(maxlen=history_length)
         self.secondary_velocity_history = deque(maxlen=history_length)
         self.secondary_timestamp_history = deque(maxlen=history_length)
+        
+        # EMA smoothed position tracking for secondary hand
+        self.secondary_smoothed_position = None
+        
+        # Volume estimation buffers
+        self.volume_history = deque(maxlen=volume_smoothing)
+        self.last_volume_estimate = None
+        
+        # Beat-based displacement tracking for volume
+        # Track position at last beat and maximum displacement since then
+        self.beat_position = None  # Position where last beat occurred
+        self.max_displacement_since_beat = 0.0  # Maximum distance from beat position
         
         # Beat tracking
         self.beat_times = deque(maxlen=tempo_memory)
         self.last_beat_time = 0.0
         self.current_beat_index = 0
         self.beats_per_measure = 4  # Default to 4/4 time
+        self.last_tempo_estimate = None  # Cache last valid tempo for neutral state
         
         # State tracking for beat detection (primary hand)
         self.last_direction = Direction.NEUTRAL
         self.last_y_position = None
         self.current_phase = MotionPhase.TRANSITION
+        self.was_neutral = False  # Track if we were in neutral state last frame
         
         # State tracking for secondary hand
         self.secondary_last_direction = Direction.NEUTRAL
@@ -235,11 +271,14 @@ class ConductingAnalyzer:
         Returns:
             ConductingFrame with analyzed conducting information
         """
-        # Store in history
-        self.position_history.append(position)
         self.timestamp_history.append(timestamp)
         
-        # Calculate velocity
+        # Smooth position to reduce jitter using EMA
+        smoothed_position = self._smooth_position(position, is_primary=True)
+        # Store smoothed position in history
+        self.position_history.append(smoothed_position)
+        
+        # Calculate velocity from smoothed positions
         velocity = self._calculate_velocity(
             self.position_history,
             self.timestamp_history
@@ -254,7 +293,7 @@ class ConductingAnalyzer:
         
         # Detect beat events (only for primary hand)
         beat_event = self._detect_beat(
-            position, velocity, direction, gesture_energy, timestamp
+            smoothed_position, velocity, direction, gesture_energy, timestamp
         )
         
         # Update beat index if beat detected
@@ -264,25 +303,53 @@ class ConductingAnalyzer:
             beat_index = self.current_beat_index
             self.beat_times.append(timestamp)
             self.last_beat_time = timestamp
+            
+            # Reset displacement tracking - new beat position established
+            self.beat_position = smoothed_position
+            self.max_displacement_since_beat = 0.0
         
         # Determine motion phase
         motion_phase = self._determine_phase(velocity, gesture_energy, timestamp)
         
-        # Estimate tempo
-        tempo_estimate = self._estimate_tempo()
+        # Detect transition from neutral to active - clear beat history to avoid stale timestamps
+        if self.was_neutral and direction != Direction.NEUTRAL:
+            # Resuming from neutral - clear beat times to start fresh
+            self.beat_times.clear()
+            self.last_beat_time = 0.0
         
-        # Create and return conducting frame
+        # Estimate tempo (but not during neutral state to prevent BPM from dropping)
+        if direction != Direction.NEUTRAL:
+            tempo_estimate = self._estimate_tempo()
+            # Cache the valid tempo for use during neutral state
+            if tempo_estimate is not None:
+                self.last_tempo_estimate = tempo_estimate
+            self.was_neutral = False
+        else:
+            # During neutral state, return the last valid tempo instead of recalculating
+            tempo_estimate = self.last_tempo_estimate
+            self.was_neutral = True
+        
+        # Estimate volume based on maximum displacement from last beat
+        volume_estimate = self._estimate_volume(smoothed_position, self.beat_position)
+        
+        # Create and return conducting frame with smoothed position
         return ConductingFrame(
             timestamp=timestamp,
-            position=position,
+            position=smoothed_position,
             velocity=velocity,
             direction=direction,
             motion_phase=motion_phase,
             beat_event=beat_event,
             beat_index=beat_index,
             tempo_estimate=tempo_estimate,
+            volume_estimate=volume_estimate,
             gesture_energy=gesture_energy,
-            metadata={'hand': 'primary'}
+            metadata={
+                'hand': 'primary',
+                'position_history': list(self.position_history),
+                'velocity_history': list(self.velocity_history),
+                'raw_position': position
+            }
         )
     
     def _update_secondary_hand(
@@ -300,11 +367,14 @@ class ConductingAnalyzer:
         Returns:
             ConductingFrame with motion analysis but no beat events
         """
-        # Store in history
+        # Store raw position in history
         self.secondary_position_history.append(position)
         self.secondary_timestamp_history.append(timestamp)
         
-        # Calculate velocity
+        # Smooth position to reduce jitter using EMA
+        smoothed_position = self._smooth_position(position, is_primary=False)
+        
+        # Calculate velocity from smoothed positions
         velocity = self._calculate_velocity(
             self.secondary_position_history,
             self.secondary_timestamp_history
@@ -317,45 +387,92 @@ class ConductingAnalyzer:
         # Calculate gesture energy
         gesture_energy = self._calculate_energy(velocity)
         
-        # Create and return conducting frame (no beat_event)
+        # Create and return conducting frame with smoothed position (no beat_event)
         return ConductingFrame(
             timestamp=timestamp,
-            position=position,
+            position=smoothed_position,
             velocity=velocity,
             direction=direction,
             gesture_energy=gesture_energy,
-            metadata={'hand': 'secondary'}
+            metadata={
+                'hand': 'secondary',
+                'position_history': list(self.secondary_position_history),
+                'velocity_history': list(self.secondary_velocity_history),
+                'raw_position': position
+            }
         )
          
-    def _calculate_velocity(
+    def _smooth_position(
         self,
-        position_history: deque,
-        timestamp_history: deque
+        position: Tuple[float, float],
+        is_primary: bool = True
     ) -> Tuple[float, float]:
-        """Calculate smoothed velocity from position history."""
+        """
+        Smooth position using Exponential Moving Average (EMA) to reduce jitter.
+        
+        EMA formula: smoothed = alpha * raw + (1 - alpha) * previous_smoothed
+        Where alpha controls responsiveness (higher = more responsive, less smoothing)
+        
+        Args:
+            position: Raw (x, y) position
+            is_primary: Whether this is for the primary hand
+            
+        Returns:
+            Smoothed (x, y) position
+        """
+        # Get the current smoothed position based on hand type
+        if is_primary:
+            previous_smoothed = self.smoothed_position
+        else:
+            previous_smoothed = self.secondary_smoothed_position
+        
+        # Initialize on first frame
+        if previous_smoothed is None:
+            smoothed = position
+        else:
+            # Apply EMA: smoothed = alpha * raw + (1 - alpha) * previous
+            alpha = self.position_smoothing_alpha
+            smoothed = (
+                alpha * position[0] + (1 - alpha) * previous_smoothed[0],
+                alpha * position[1] + (1 - alpha) * previous_smoothed[1]
+            )
+        
+        # Store the smoothed position
+        if is_primary:
+            self.smoothed_position = smoothed
+        else:
+            self.secondary_smoothed_position = smoothed
+        
+        return smoothed
+         
+    def _calculate_velocity(self, position_history: deque, timestamp_history: deque):
         if len(position_history) < 2:
             return (0.0, 0.0)
-        
-        # Calculate instantaneous velocity
+
+        # Convert to lists
         positions = list(position_history)
         timestamps = list(timestamp_history)
-        
+
+        # Compute finite differences for last N frames
         velocities = []
         for i in range(1, min(self.velocity_smoothing + 1, len(positions))):
-            dt = timestamps[-1] - timestamps[-i-1]
-            if dt > 0:
-                dx = positions[-1][0] - positions[-i-1][0]
-                dy = positions[-1][1] - positions[-i-1][1]
-                velocities.append((dx / dt, dy / dt))
-        
+            dt = timestamps[-i] - timestamps[-i-1]
+            if dt <= 0:
+                continue
+            dx = positions[-i][0] - positions[-i-1][0]
+            dy = positions[-i][1] - positions[-i-1][1]
+            velocities.append((dx / dt, dy / dt))
+
         if not velocities:
             return (0.0, 0.0)
-        
-        # Average velocities for smoothing
-        vx = sum(v[0] for v in velocities) / len(velocities)
-        vy = sum(v[1] for v in velocities) / len(velocities)
-        
+
+        # Weighted moving average (newer frames weighted more)
+        weights = np.linspace(1, len(velocities), len(velocities))
+        vx = np.average([v[0] for v in velocities], weights=weights)
+        vy = np.average([v[1] for v in velocities], weights=weights)
+
         return (vx, vy)
+
     
     def _calculate_direction(
         self,
@@ -520,6 +637,60 @@ class ConductingAnalyzer:
         
         return sum(intervals) / len(intervals)
     
+    def _estimate_volume(
+        self,
+        position: Tuple[float, float],
+        beat_position: Optional[Tuple[float, float]],
+    ) -> tuple[Optional[float], float]:
+        """
+        Estimate volume level based on maximum displacement from last beat position.
+        Measures how far the hand has moved since the last beat was detected.
+        Only considers movement during PRE_BEAT and TRANSITION phases
+        (excludes ON_BEAT and POST_BEAT phases).
+        
+        Args:
+            position: (x, y) current position
+            beat_position: (x, y) position where last beat occurred (or None if no beat yet)
+            
+        Returns:
+            volume_estimate: Estimated volume level (float) or None
+        """
+        # If no beat position yet, can't calculate displacement
+        if beat_position is None:
+            return self.last_volume_estimate
+        
+        # Calculate current displacement from beat position
+        dx = position[0] - beat_position[0]
+        dy = position[1] - beat_position[1]
+        current_displacement = np.sqrt(dx**2 + dy**2)
+        
+        # Update maximum displacement if current is larger
+        max_displacement = max(self.max_displacement_since_beat, current_displacement)
+        self.max_displacement_since_beat = max_displacement
+        
+        # Only adjust volume if there's significant displacement
+        if max_displacement < self.volume_displacement_threshold:
+            # Below threshold, maintain last volume estimate
+            return self.last_volume_estimate
+        
+        # Normalize displacement (assuming typical max displacement is 0-0.3 of screen)
+        # Larger displacement = louder volume
+        normalized_displacement = min(max_displacement / 0.3, 1.0)  # Cap at 1.0
+        
+        # Scale to volume range [min_volume, max_volume]
+        raw_volume = normalized_displacement * (self.max_volume - self.min_volume) + self.min_volume
+        
+        # Add to volume history for smoothing
+        self.volume_history.append(raw_volume)
+        
+        # Calculate smoothed volume (average of recent estimates)
+        if len(self.volume_history) > 0:
+            smoothed_volume = sum(self.volume_history) / len(self.volume_history)
+            self.last_volume_estimate = smoothed_volume
+            return round(smoothed_volume, 3)
+        
+        return self.last_volume_estimate
+    
     def set_time_signature(self, beats_per_measure: int):
         """
         Set the time signature (beats per measure).
@@ -554,20 +725,30 @@ class ConductingAnalyzer:
         self.position_history.clear()
         self.velocity_history.clear()
         self.timestamp_history.clear()
+        self.smoothed_position = None
         
         # Secondary hand state
         self.secondary_position_history.clear()
         self.secondary_velocity_history.clear()
         self.secondary_timestamp_history.clear()
+        self.secondary_smoothed_position = None
         
         # Beat tracking
         self.beat_times.clear()
         self.last_beat_time = 0.0
         self.current_beat_index = 0
+        self.last_tempo_estimate = None
+        
+        # Volume tracking
+        self.volume_history.clear()
+        self.last_volume_estimate = None
+        self.beat_position = None
+        self.max_displacement_since_beat = 0.0
         
         # Direction tracking
         self.last_direction = Direction.NEUTRAL
         self.secondary_last_direction = Direction.NEUTRAL
+        self.was_neutral = False
         
         # Phase tracking
         self.current_phase = MotionPhase.TRANSITION

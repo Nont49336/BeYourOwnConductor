@@ -26,6 +26,8 @@ class DynamicMidiPlayer:
         self.original_tempo = None  # microseconds per beat from MIDI file
         self.current_bpm = bpm
         self.volume = max(0.0, min(2.0, volume))  # Clamp volume between 0.0 and 2.0
+        self.target_volume = self.volume  # Target volume for fading
+        self.fade_active = False  # Whether a fade is in progress
         self.running = False
         self.paused = False
         
@@ -42,6 +44,8 @@ class DynamicMidiPlayer:
         self.track_muted = []  # List of boolean values for each track
         self.track_volumes = []  # List of volume multipliers for each track
         self.track_solo = []  # List of boolean values for solo mode
+        self.thread = None
+        self.fade_thread = None  # Thread for volume fading
         
         os_name = platform.system()
         if os_name == "Windows":
@@ -209,8 +213,11 @@ class DynamicMidiPlayer:
         Args:
             volume: Volume level (0.0 = silent, 1.0 = full volume, 2.0 = twice full volume)
         """
-        self.volume = max(0.0, min(2.0, volume))
-        print(f"[Volume] Volume set to: {self.volume:.2f} ({int(self.volume * 100)}%)")
+        self.target_volume = max(0.0, min(2.0, volume))
+        # Update immediately if no fade is active
+        if not self.fade_active:
+            self.volume = self.target_volume
+        print(f"[Volume] Volume set to: {self.target_volume:.2f} ({int(self.target_volume * 100)}%)")
 
     def get_volume(self) -> float:
         """Get the current volume level (0.0 to 2.0)."""
@@ -366,6 +373,41 @@ class DynamicMidiPlayer:
             self.fs.cc(channel, 120, 0)  # All sound off
         self.active_notes.clear()
 
+    def _fade_volume(self, target_volume: float, duration: float = 0.3):
+        """
+        Smoothly fade volume from current level to target level over duration.
+        Runs in a background thread to avoid blocking.
+        
+        Args:
+            target_volume: Target volume level (0.0 to 2.0)
+            duration: Fade duration in seconds (default: 0.3)
+        """
+        def fade_worker():
+            self.fade_active = True
+            start_volume = self.volume
+            start_time = time.time()
+            
+            while time.time() - start_time < duration and self.running:
+                elapsed = time.time() - start_time
+                progress = elapsed / duration
+                
+                # Linear interpolation
+                self.volume = start_volume + (target_volume - start_volume) * progress
+                time.sleep(0.01)  # Update every 10ms for smooth fade
+            
+            # Ensure we reach the exact target volume
+            self.volume = target_volume
+            self.fade_active = False
+        
+        # Stop any existing fade
+        if self.fade_thread and self.fade_thread.is_alive():
+            self.fade_active = False
+            self.fade_thread.join(timeout=0.1)
+        
+        # Start new fade in background thread
+        self.fade_thread = threading.Thread(target=fade_worker, daemon=True)
+        self.fade_thread.start()
+
     def start(self):
         """Prepare for playback but wait for beat-by-beat triggers."""
         if not self.is_file_loaded():
@@ -382,7 +424,7 @@ class DynamicMidiPlayer:
         print(f"[MIDI] ▶ Ready to play at {self.current_bpm:.1f} BPM: {os.path.basename(self.midi_path)}")
 
     def pause(self):
-        """Pause playback. Call resume() to continue."""
+        """Pause playback with a smooth fade-down effect. Call resume() to continue."""
         if not self.running:
             print("[MIDI] Not playing.")
             return
@@ -396,12 +438,16 @@ class DynamicMidiPlayer:
             self.beat_timer.cancel()
             self.beat_timer = None
         
+        # Fade volume down to 0 over 1 second (non-blocking)
+        self._fade_volume(0.0, duration=1.0)
+        
+        # Set paused flag immediately - fade happens in background
         self.paused = True
-        self._all_notes_off()  # Silence any currently playing notes
-        print("[MIDI] ⏸ Playback paused.")
+        
+        print("[MIDI] ⏸ Playback pausing (with fade).")
 
     def resume(self):
-        """Resume playback from where it was paused."""
+        """Resume playback with a smooth fade-in effect."""
         if not self.running:
             print("[MIDI] Not playing.")
             return
@@ -410,8 +456,14 @@ class DynamicMidiPlayer:
             print("[MIDI] Not paused.")
             return
         
+        # Unpause immediately so music resumes
         self.paused = False
         print(f"[MIDI] ▶ Ready to resume at {self.current_bpm:.1f} BPM.")
+        
+        print(f"[MIDI] ▶ Playback resuming at {self.current_bpm:.1f} BPM (with fade).")
+        
+        # Fade volume up from current (likely 0) to target over 1 second (non-blocking)
+        self._fade_volume(self.target_volume, duration=1.0)
 
     def is_paused(self) -> bool:
         """Check if playback is currently paused."""

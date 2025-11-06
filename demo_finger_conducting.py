@@ -9,7 +9,6 @@ to perform finger-based music conducting.
 import argparse
 import copy
 import cv2 as cv
-from collections import deque
 import os
 
 from vision_modules.hand_tracking import Handedness, HandTracking
@@ -44,25 +43,91 @@ def get_args():
                        help='Primary conducting hand: "right" or "left" (default: right)')
     parser.add_argument("--num_hands", type=int, default=2,
                         help='Maximum number of hands to track (default: 2)')
+    parser.add_argument("--velocity_smoothing", type=int, default=4,
+                        help='Smoothing factor for velocity calculation (default: 4)')
+    parser.add_argument("--neutral_velocity_threshold", type=float, default=0.24,
+                        help='Neutral velocity threshold for gesture volume control (default: 0.3)')
+    parser.add_argument("--history_length", type=int, default=40,
+                        help='Length of position history for conducting analysis (default: 40)')
     
     return parser.parse_args()
 
 
-def draw_point_history(image, point_history, beat_position=None):
-    """Draw the trail of finger movement history with optional beat highlight."""
-    for index, point in enumerate(point_history):
-        if point[0] != 0 and point[1] != 0:
+def draw_point_history(image, conducting_frame: ConductingFrame, beat_history: list, velocity_smoothing: int, history_length: int):
+    """Draw the trail of finger position history with beat highlight.
+    
+    Args:
+        image: The image to draw on
+        conducting_frame: The conducting frame with position history
+        beat_history: List tracking which positions in history were beats (same length as position_history)
+    """
+    if not conducting_frame or not conducting_frame.metadata:
+        return image
+    
+    # only draw if position history is full
+    if len(conducting_frame.metadata.get('position_history', [])) < history_length:
+        return image
+
+    # Get position history from metadata
+    position_history = conducting_frame.metadata.get('position_history', [])
+    
+    if len(position_history) < 2:
+        return image
+    
+    h, w = image.shape[:2]
+    
+    # Draw position history as circles
+    for index, pos in enumerate(position_history):
+        if pos[0] != 0 and pos[1] != 0:
+            # De-normalize to pixel coordinates
+            x = int(pos[0] * w)
+            y = int(pos[1] * h)
+            
             # Calculate radius based on age (newer points are larger)
             radius = 1 + int(index / 2)
             
-            # Highlight the beat position with a different color
-            if beat_position and abs(point[0] - beat_position[0]) < 5 and abs(point[1] - beat_position[1]) < 5:
-                # Draw bright yellow circle for beat ictus point
-                cv.circle(image, (point[0], point[1]), radius + 3, (0, 255, 255), -1)
-                cv.circle(image, (point[0], point[1]), radius + 3, (0, 200, 255), 2)
+            # Check if this position was a beat event
+            # offset by velocity smoothing to align with history
+            offset_index = min(len(beat_history) - 1, index + velocity_smoothing)
+            is_beat = offset_index < len(beat_history) and beat_history[offset_index]
+            
+            if is_beat:
+                # Draw bright yellow circle for beat ictus point (persists and fades)
+                cv.circle(image, (x, y), radius + 3, (0, 255, 255), -1)
+                cv.circle(image, (x, y), radius + 3, (0, 200, 255), 2)
             else:
                 # Draw circles with green color that fades
-                cv.circle(image, (point[0], point[1]), radius, (152, 251, 152), 2)
+                cv.circle(image, (x, y), radius, (152, 251, 152), 2)
+    return image
+
+
+def draw_smoothed_position_trail(image, conducting_frame: ConductingFrame):
+    """Draw smoothed position history as connected lines."""
+    if not conducting_frame or not conducting_frame.metadata:
+        return image
+    
+    position_history = conducting_frame.metadata.get('position_history', [])
+    if len(position_history) < 2:
+        return image
+    
+    h, w = image.shape[:2]
+    
+    # Convert normalized positions to pixel coordinates and draw lines
+    points = []
+    for pos in position_history:
+        if pos[0] != 0 and pos[1] != 0:
+            x = int(pos[0] * w)
+            y = int(pos[1] * h)
+            points.append((x, y))
+    
+    # Draw connected lines for smoothed trail (use blue to distinguish from green circles)
+    for i in range(1, len(points)):
+        # Calculate alpha based on age (older = more transparent)
+        alpha = i / len(points)
+        thickness = 2 if i >= len(points) - 5 else 1  # Thicker for recent points
+        color = (255, int(100 + 155 * alpha), 0)  # Blue to cyan gradient
+        cv.line(image, points[i-1], points[i], color, thickness, cv.LINE_AA)
+    
     return image
 
 
@@ -147,14 +212,99 @@ def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_
     return image
 
 
+def draw_velocity_graph(image, conducting_frame: ConductingFrame, neutral_velocity_threshold: float = 0.25):
+    """Draw velocity history graph in the top-right corner."""
+    if not conducting_frame or not conducting_frame.metadata:
+        return image
+    
+    velocity_history = conducting_frame.metadata.get('velocity_history', [])
+    if len(velocity_history) < 2:
+        return image
+    
+    h, w = image.shape[:2]
+    
+    # Graph dimensions and position (top-right corner)
+    graph_width = 200
+    graph_height = 80
+    graph_x = w - graph_width - 10
+    graph_y = 30
+    padding = 5
+    
+    # Draw background
+    cv.rectangle(image, (graph_x - padding, graph_y - padding), 
+                (graph_x + graph_width + padding, graph_y + graph_height + padding),
+                (0, 0, 0), -1)
+    cv.rectangle(image, (graph_x - padding, graph_y - padding), 
+                (graph_x + graph_width + padding, graph_y + graph_height + padding),
+                (255, 255, 255), 1)
+    
+    # Draw title
+    cv.putText(image, "Velocity (Y)", (graph_x, graph_y - 10),
+              cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+    
+    # Extract vertical velocities (vy) with negative values
+    velocities = [-v[1] for v in velocity_history]  # Negative because down is positive in screen coordinates
+    
+    if len(velocities) == 0:
+        return image
+    
+    # Find min/max for symmetric scaling around zero
+    max_abs_velocity = max(abs(v) for v in velocities) if velocities else 1.0
+    max_abs_velocity = max(max_abs_velocity, 0.5)  # Ensure a minimum scale
+    
+    # Draw reference lines
+    center_y = graph_y + graph_height // 2  # Zero line at center
+    
+    # Zero line (horizontal center)
+    cv.line(image, (graph_x, center_y), (graph_x + graph_width, center_y),
+           (150, 150, 150), 1, cv.LINE_AA)
+    
+    # Positive neutral threshold line
+    pos_threshold_y = center_y - int((neutral_velocity_threshold / max_abs_velocity) * (graph_height // 2))
+    if 0 <= pos_threshold_y - graph_y <= graph_height:
+        cv.line(image, (graph_x, pos_threshold_y), (graph_x + graph_width, pos_threshold_y),
+               (100, 100, 100), 1, cv.LINE_AA)
+    
+    # Negative neutral threshold line
+    neg_threshold_y = center_y + int((neutral_velocity_threshold / max_abs_velocity) * (graph_height // 2))
+    if 0 <= neg_threshold_y - graph_y <= graph_height:
+        cv.line(image, (graph_x, neg_threshold_y), (graph_x + graph_width, neg_threshold_y),
+               (100, 100, 100), 1, cv.LINE_AA)
+    
+    # Draw velocity graph
+    points = []
+    for i, vel in enumerate(velocities):
+        x = graph_x + int((i / (len(velocities) - 1)) * graph_width)
+        # Scale velocity to graph, centered at zero
+        y = center_y - int((vel / max_abs_velocity) * (graph_height // 2))
+        # Clamp to graph bounds
+        y = max(graph_y, min(graph_y + graph_height, y))
+        points.append((x, y))
+    
+    # Draw lines connecting points
+    for i in range(1, len(points)):
+        # Color gradient from older (darker) to newer (brighter)
+        alpha = i / len(points)
+        color = (0, int(100 + 155 * alpha), int(100 + 155 * alpha))
+        cv.line(image, points[i-1], points[i], color, 2, cv.LINE_AA)
+    
+    # Draw current velocity value
+    current_velocity = velocities[-1]
+    vel_text = f"{current_velocity:.3f}"
+    cv.putText(image, vel_text, (graph_x + graph_width - 60, graph_y + graph_height + 18),
+              cv.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1, cv.LINE_AA)
+    
+    return image
+
+
 def draw_pattern_guide(image, conducting_analyzer):
     """Draw the time signature guide in the corner."""
     pattern_info = conducting_analyzer.get_pattern_info()
     
-    # Position in top-right corner
+    # Position in top-right corner (moved down to make room for velocity graph)
     h, w = image.shape[:2]
     start_x = w - 220
-    start_y = 30
+    start_y = 150  # Moved down from 30 to make room for velocity graph
     
     # Draw background
     cv.rectangle(image, (start_x - 10, start_y - 25), (w - 10, start_y + 95),
@@ -419,6 +569,158 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
             return track_idx
     
     return None
+def draw_countdown_overlay(image, countdown_beats_detected, countdown_required, calibrated_bpm=None):
+    """Draw countdown overlay showing beat calibration progress."""
+    h, w = image.shape[:2]
+    
+    # Smaller overlay in top-right corner (below velocity graph and above pattern guide)
+    overlay_width = 250
+    overlay_height = 140
+    overlay_x = w - overlay_width - 20
+    overlay_y = 120  # Position below velocity graph
+    padding = 10
+    
+    # Create semi-transparent overlay
+    overlay = image.copy()
+    cv.rectangle(overlay, (overlay_x - padding, overlay_y - padding), 
+                (overlay_x + overlay_width + padding, overlay_y + overlay_height + padding),
+                (0, 0, 0), -1)
+    cv.addWeighted(overlay, 0.5, image, 0.5, 0, image)  # More transparent (50% instead of 80%)
+    
+    # Draw subtle border
+    cv.rectangle(image, (overlay_x - padding, overlay_y - padding), 
+                (overlay_x + overlay_width + padding, overlay_y + overlay_height + padding),
+                (0, 200, 200), 1)
+    
+    # Title - smaller font
+    title_text = "Calibrating"
+    cv.putText(image, title_text, (overlay_x, overlay_y + 20),
+              cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 200), 1, cv.LINE_AA)
+    
+    # Beat counter - smaller and more compact
+    counter_text = f"{countdown_beats_detected} / {countdown_required}"
+    cv.putText(image, counter_text, (overlay_x, overlay_y + 60),
+              cv.FONT_HERSHEY_SIMPLEX, 1.8, (255, 255, 255), 2, cv.LINE_AA)
+    
+    # Show calibrated BPM if available - smaller font
+    if calibrated_bpm is not None:
+        bpm_text = f"{calibrated_bpm:.1f} BPM"
+        cv.putText(image, bpm_text, (overlay_x, overlay_y + 90),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv.LINE_AA)
+    
+    # Draw beat indicators (smaller circles)
+    indicator_y = overlay_y + overlay_height - 20
+    total_width = countdown_required * 30
+    start_x = overlay_x + (overlay_width - total_width) // 2
+    
+    for i in range(countdown_required):
+        x = start_x + i * 30 + 15
+        if i < countdown_beats_detected:
+            # Filled circle for detected beat - smaller
+            cv.circle(image, (x, indicator_y), 8, (0, 255, 0), -1)
+            cv.circle(image, (x, indicator_y), 8, (0, 200, 0), 1)
+        else:
+            # Empty circle for pending beat - smaller
+            cv.circle(image, (x, indicator_y), 8, (80, 80, 80), 1)
+    
+    return image
+
+def draw_controls_overlay(image, waiting_for_conducting=False):
+    """Draw controls overlay at the bottom of the screen."""
+    h, w = image.shape[:2]
+    
+    # Create semi-transparent overlay background at the bottom
+    overlay = image.copy()
+    overlay_height = 180
+    overlay_y_start = h - overlay_height
+    cv.rectangle(overlay, (0, overlay_y_start), (w, h), (0, 0, 0), -1)
+    cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+    
+    # Instructions at top of overlay
+    if waiting_for_conducting:
+        instruction_text = "Ready! Start conducting to begin music..."
+        instruction_color = (0, 255, 255)  # Yellow to indicate waiting
+    else:
+        instruction_text = "Press SPACE to start countdown and calibrate tempo!"
+        instruction_color = (0, 255, 0)
+    
+    instruction_size = cv.getTextSize(instruction_text, cv.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+    instruction_x = (w - instruction_size[0]) // 2
+    cv.putText(image, instruction_text, (instruction_x, overlay_y_start + 30),
+              cv.FONT_HERSHEY_SIMPLEX, 0.7, instruction_color, 2, cv.LINE_AA)
+    
+    # Title
+    title_text = "CONTROLS"
+    title_size = cv.getTextSize(title_text, cv.FONT_HERSHEY_SIMPLEX, 1.2, 2)[0]
+    title_x = (w - title_size[0]) // 2
+    cv.putText(image, title_text, (title_x, overlay_y_start + 65),
+              cv.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2, cv.LINE_AA)
+    
+    # Controls list
+    controls = [
+        "SPACE - Start Countdown/Pause",
+        "2/3/4 - Change Time Signature",
+        "G - Toggle Pattern Guide",
+        "H - Switch Primary Hand",
+        "R - Reset Conducting State",
+        "ESC - Exit"
+    ]
+    
+    # Draw controls in two columns
+    start_y = overlay_y_start + 100
+    line_height = 25
+    col1_x = 50
+    col2_x = w // 2 + 50
+    
+    for i, control in enumerate(controls):
+        if i < 3:
+            x = col1_x
+            y = start_y + i * line_height
+        else:
+            x = col2_x
+            y = start_y + (i - 3) * line_height
+        
+        cv.putText(image, control, (x, y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv.LINE_AA)
+    
+    return image
+
+def draw_conducting_path(image, time_signature: int, primary_hand: Handedness):
+    """Draw conducting path based on time signature."""
+    overlay = cv.imread(f'resources/{time_signature}_time_signature_guide.png', cv.IMREAD_UNCHANGED)
+    if overlay is None:
+        return image
+
+    h, w = image.shape[:2]
+    overlay_height = int(h * 0.7) # 70% of window height
+    overlay_width = int(overlay.shape[1] * (overlay_height / overlay.shape[0]))
+    overlay = cv.resize(overlay, (overlay_width, overlay_height))
+
+    if primary_hand == Handedness.LEFT:
+        # Flip overlay for left hand
+        overlay = cv.flip(overlay, 1)
+
+    # Position of overlay
+    y1, y2 = (h - overlay_height) // 2, (h + overlay_height) // 2
+    if primary_hand == Handedness.RIGHT:
+        x1, x2 = w - overlay_width - 50, w - 50
+    else:
+        x1, x2 = 50, 50 + overlay_width
+    
+    # Extract BGR and alpha channels
+    overlay_bgr = overlay[:, :, :3]
+    overlay_alpha = overlay[:, :, 3:4] / 255.0  # Normalize to 0-1
+    
+    # Get the region of interest from the background
+    background_region = image[y1:y2, x1:x2, :3]
+    
+    # Blend using alpha channel
+    blended = overlay_bgr * overlay_alpha + background_region * (1 - overlay_alpha)
+    
+    # Place the blended result back onto the image
+    image[y1:y2, x1:x2, :3] = blended.astype('uint8')
+
+    return image
 
 def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
     """Load MIDI file and SoundFont into the DynamicMidiPlayer."""
@@ -462,10 +764,9 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
     
     # Initialize hand tracking
-    primary_hand = Handedness.from_str(args.primary_hand) if args.num_hands > 1 else None
     hand_tracker = HandTracking(
         max_num_hands=args.num_hands,
-        primary_hand=primary_hand,
+        primary_hand=Handedness.from_str(args.primary_hand),
         min_detection_confidence=0.7,
         min_tracking_confidence=0.5,
         history_length=16
@@ -473,11 +774,15 @@ def main():
     
     # Initialize conducting analyzer with improved neutral detection
     conducting_analyzer = FingerConductingAnalyzer(
-        history_length=30,
-        velocity_smoothing=3,
-        tempo_memory=10,
-        neutral_velocity_threshold=0.25,  # Higher threshold now that we require duration
-        neutral_duration_threshold=0.5    # Must be below threshold for 0.5s to be neutral
+        history_length=args.history_length,
+        velocity_smoothing=args.velocity_smoothing,
+        tempo_memory=2,
+        neutral_velocity_threshold=args.neutral_velocity_threshold,
+        neutral_duration_threshold=0.5,   # Must be below threshold for 0.5s to be neutral
+        volume_smoothing=10,              # Smooth volume over frames to prevent rapid changes
+        min_volume=0.5,                   # Minimum volume level
+        max_volume=2.0,                   # Maximum volume level
+        volume_displacement_threshold=0.02,
     )
     conducting_analyzer.set_time_signature(args.time_signature)
 
@@ -489,15 +794,14 @@ def main():
         initial_bpm=INITIAL_BPM
     )
     
-    # Initialize point history for trail visualization
-    history_length = 32  # Length of the trail
-    point_history = deque(maxlen=history_length)
-    secondary_point_history = deque(maxlen=history_length)
-    
     # Beat display tracking
     import time
     last_beat_time = 0.0
-    beat_position = None  # Position where beat occurred
+    
+    # Beat history tracking for visualization (tracks which positions were beats)
+    from collections import deque
+    primary_beat_history = deque(maxlen=40)  # Match history_length from analyzer
+    secondary_beat_history = deque(maxlen=40)
     
     # Track volume control state
     last_hovered_track = None
@@ -505,16 +809,26 @@ def main():
     
     # Get and display pattern information
     pattern_info = conducting_analyzer.get_pattern_info()
+    guide_enabled = False
+    
+    # Waiting for first conducting gesture to start playback
+    waiting_for_conducting = False
+    
+    # Beat countdown state
+    countdown_active = False
+    countdown_beats_detected = 0
+    countdown_required = conducting_analyzer.beats_per_measure
+    countdown_beat_times = []
+    calibrated_bpm = None
     
     print("Finger Conducting Demo")
     print(f"Time Signature: {pattern_info['time_signature']}")
     print("Beat Detection: Lowest point of downward motion (ictus)")
-    print("\nControls:")
-    print("  ESC     - Exit")
-    print("  SPACE   - Play/Pause music")
-    print("  'r'     - Reset conducting state")
-    print("  '2/3/4' - Change time signature to 2/4, 3/4, or 4/4")
-    print("  'h'     - Switch primary hand")
+    print("Press ESC to exit")
+    print("Press 'r' to reset conducting state")
+    print("Press 'h' to switch primary hand")
+    print("Press '2', '3', or '4' to change time signature")
+    print(f"Press SPACE to start countdown ({countdown_required} beats to calibrate tempo)")
     print("\nConducting:")
     print("  Primary Hand   - Controls tempo and beats")
     print("  Secondary Hand - Normal: Adjust global volume (all tracks)")
@@ -531,8 +845,14 @@ def main():
             elif key == 32:  # SPACE
                 if player is not None:
                     if not player.running:
-                        player.start()
-                        print("Playback started")
+                        # Arm playback - start countdown for tempo calibration
+                        waiting_for_conducting = True
+                        countdown_active = True
+                        countdown_beats_detected = 0
+                        countdown_required = conducting_analyzer.beats_per_measure
+                        countdown_beat_times = []
+                        calibrated_bpm = None
+                        print(f"Countdown started - conduct {countdown_required} beats to calibrate tempo")
                     elif player.is_paused():
                         player.resume()
                         print("Playback resumed")
@@ -541,16 +861,24 @@ def main():
                         print("Playback paused")
             elif key == ord('r'):  # Reset
                 conducting_analyzer.reset()
+                countdown_active = False
+                waiting_for_conducting = False
                 print("Conducting state reset")
             elif key == ord('2'):  # Switch to 2/4 time
                 conducting_analyzer.set_time_signature(2)
+                countdown_required = 2
                 print("\nSwitched to 2/4 time")
             elif key == ord('3'):  # Switch to 3/4 time
                 conducting_analyzer.set_time_signature(3)
+                countdown_required = 3
                 print("\nSwitched to 3/4 time")
             elif key == ord('4'):  # Switch to 4/4 time
                 conducting_analyzer.set_time_signature(4)
+                countdown_required = 4
                 print("\nSwitched to 4/4 time")
+            elif key == ord('g'): # Toggle guide
+                guide_enabled = not guide_enabled
+                print(f"\nPattern guide {'enabled' if guide_enabled else 'disabled'}")
             elif key == ord('h'):  # Switch primary hand
                 new_primary_hand = Handedness.LEFT if hand_tracker.primary_hand == Handedness.RIGHT else Handedness.RIGHT
                 hand_tracker.set_primary_hand(new_primary_hand)
@@ -574,31 +902,28 @@ def main():
             # Extract positions for both hands
             primary_position = None
             secondary_position = None
+            secondary_hand_pixel_pos = None
+            is_pointer_mode = False
             h, w = frame.shape[:2]
             
             if primary_hand_results is not None and primary_hand_results.hand_detected:
                 landmark_list = primary_hand_results.landmark_list
                 if len(landmark_list) > 8:
                     finger_tip = landmark_list[8]
-                    # Add to point history for trail visualization
-                    point_history.append(finger_tip)
                     # Normalize position to 0-1
                     primary_position = (finger_tip[0] / w, finger_tip[1] / h)
-            else:
-                # No primary hand detected, add empty point
-                point_history.append([0, 0])
             
             if secondary_hand_results is not None and secondary_hand_results.hand_detected:
                 landmark_list = secondary_hand_results.landmark_list
                 if len(landmark_list) > 8:
                     finger_tip = landmark_list[8]
-                    # Add to secondary point history for trail visualization
-                    secondary_point_history.append(finger_tip)
                     # Normalize position to 0-1
                     secondary_position = (finger_tip[0] / w, finger_tip[1] / h)
-            else:
-                # No secondary hand detected, add empty point
-                secondary_point_history.append([0, 0])
+                    # Get pixel position for UI interaction
+                    secondary_hand_pixel_pos = (finger_tip[0], finger_tip[1])
+                
+                # Check if secondary hand is in "Pointer" mode (gesture ID 2)
+                is_pointer_mode = (secondary_hand_results.hand_sign_id == 2)
             
             # Update conducting analyzer with both hands
             conducting_frame, secondary_conducting_frame = conducting_analyzer.update_both_hands(
@@ -607,35 +932,89 @@ def main():
                 timestamp=primary_hand_results.timestamp if primary_hand_results else None
             )
             
+            # Track beat events for visualization (primary hand)
+            if conducting_frame:
+                primary_beat_history.append(conducting_frame.beat_event == BeatEvent.BEAT)
+            else:
+                primary_beat_history.append(False)
+            
+            # Track beat events for visualization (secondary hand)
+            if secondary_conducting_frame:
+                secondary_beat_history.append(secondary_conducting_frame.beat_event == BeatEvent.BEAT)
+            else:
+                secondary_beat_history.append(False)
+            
+            # Handle countdown for tempo calibration
+            if countdown_active and conducting_frame:
+                # Check for beat events during countdown
+                if conducting_frame.beat_event:
+                    countdown_beats_detected += 1
+                    countdown_beat_times.append(time.time())
+                    print(f"Countdown beat {countdown_beats_detected}/{countdown_required}")
+                    
+                    # Calculate calibrated BPM from countdown beats
+                    if len(countdown_beat_times) >= 2:
+                        intervals = []
+                        for i in range(1, len(countdown_beat_times)):
+                            intervals.append(countdown_beat_times[i] - countdown_beat_times[i-1])
+                        avg_interval = sum(intervals) / len(intervals)
+                        calibrated_bpm = 60.0 / avg_interval
+                    
+                    # Check if countdown complete
+                    if countdown_beats_detected >= countdown_required:
+                        countdown_active = False
+                        # Start playback with calibrated tempo
+                        if player is not None and calibrated_bpm is not None:
+                            player.set_bpm(calibrated_bpm)
+                            player.start()
+                            waiting_for_conducting = False
+                            print(f"Playback started with calibrated tempo: {calibrated_bpm:.1f} BPM")
+                        else:
+                            # Fallback: just start playback
+                            if player is not None:
+                                player.start()
+                                waiting_for_conducting = False
+                                print("Playback started")
+            
+            # Legacy: Check if waiting for conducting gesture to start playback (no countdown)
+            elif waiting_for_conducting and not countdown_active and conducting_frame:
+                if conducting_frame.direction != Direction.NEUTRAL:
+                    # First non-neutral conducting gesture detected, start playback
+                    if player is not None:
+                        player.start()
+                        waiting_for_conducting = False
+                        print("Playback started (conducting gesture detected)")
+            
             # Track beat events (only from primary hand)
             if conducting_frame and conducting_frame.beat_event:
                 last_beat_time = time.time()
-                # Get beat position from primary hand for trail highlight
-                if primary_hand_results and len(primary_hand_results.landmark_list) > 8:
-                    beat_position = primary_hand_results.landmark_list[8]
                 print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
                       f"tempo {conducting_frame.tempo_estimate} BPM")
-                
-                # Play the next beat when a conducting beat is detected
-                if player is not None and player.running:
-                    if conducting_frame.tempo_estimate:
+
+                # Sync MIDI player tempo with conducting tempo (only if not neutral)
+                if player is not None and player.running and conducting_frame.tempo_estimate:
+                    if conducting_frame.direction != Direction.NEUTRAL:
                         player.set_bpm(conducting_frame.tempo_estimate)
                     player.play_next_beat()  # Add this method call to play the next beat
             
-            # Track volume control with secondary hand
-            is_pointer_mode = False
+            # Pause/resume music based on conducting state
+            if player is not None and player.running:
+                if conducting_frame:
+                    if conducting_frame.direction == Direction.NEUTRAL:
+                        # Pause music when conductor stops moving
+                        if not player.is_paused():
+                            player.pause()
+                            print("Music paused (neutral state)")
+                    else:
+                        # Resume music when conductor starts moving
+                        if player.is_paused():
+                            player.resume()
+                            print("Music resumed")
+            
+            # Adjust volume
+            # Based on secondary hand's vertical position
+            # Track sound effects (only from secondary hand)
             hovered_track_idx = None
-            secondary_hand_pixel_pos = None
-            
-            if secondary_hand_results is not None and secondary_hand_results.hand_detected:
-                # Check if secondary hand is in "Pointer" mode (gesture ID 2)
-                is_pointer_mode = (secondary_hand_results.hand_sign_id == 2)
-                
-                # Get pixel position for UI interaction
-                if len(secondary_hand_results.landmark_list) > 8:
-                    finger_tip = secondary_hand_results.landmark_list[8]
-                    secondary_hand_pixel_pos = (finger_tip[0], finger_tip[1])
-            
             if secondary_conducting_frame:
                 if player is not None:
                     if is_pointer_mode:
@@ -696,20 +1075,43 @@ def main():
                             tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
                             vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
                             player.set_volume(vol_level)
-            
-            # Draw point history trail with beat highlight
-            display_image = draw_point_history(display_image, point_history, beat_position)
-            display_image = draw_point_history(display_image, secondary_point_history)
+
+            # Draw point history trail with beat highlight (green circles for smoothed positions, yellow for beats)
+            if conducting_frame:
+                display_image = draw_point_history(display_image, conducting_frame, list(primary_beat_history), args.velocity_smoothing, args.history_length)
+            if secondary_conducting_frame:
+                display_image = draw_point_history(display_image, secondary_conducting_frame, list(secondary_beat_history), args.velocity_smoothing, args.history_length)
+
+            # Draw smoothed position trails (blue lines) over raw detection (green circles)
+            if conducting_frame:
+                display_image = draw_smoothed_position_trail(display_image, conducting_frame)
+            if secondary_conducting_frame:
+                display_image = draw_smoothed_position_trail(display_image, secondary_conducting_frame)
             
             # Draw conducting visualization
             if conducting_frame:
                 display_image = draw_conducting_info(display_image, conducting_frame, last_beat_time)
             
+            # Draw velocity graph
+            if conducting_frame:
+                display_image = draw_velocity_graph(display_image, conducting_frame, args.neutral_velocity_threshold)
+            
             # Draw pattern guide
             display_image = draw_pattern_guide(display_image, conducting_analyzer)
+            if guide_enabled:
+                display_image = draw_conducting_path(display_image, conducting_analyzer.beats_per_measure, hand_tracker.primary_hand)
+            
+            # Draw countdown overlay if active
+            if countdown_active:
+                display_image = draw_countdown_overlay(display_image, countdown_beats_detected, 
+                                                      countdown_required, calibrated_bpm)
+            
+            # Draw controls overlay if music hasn't started yet or waiting for conducting (but not during countdown)
+            elif not player.running or waiting_for_conducting:
+                display_image = draw_controls_overlay(display_image, waiting_for_conducting)
             
             # Draw track selection overlay if in pointer mode
-            if is_pointer_mode:
+            if secondary_conducting_frame and is_pointer_mode:
                 display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, hovered_track_idx)
             
             # Display the frame
