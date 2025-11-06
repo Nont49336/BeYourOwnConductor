@@ -32,8 +32,10 @@ class DynamicMidiPlayer:
         # Beat and note organization
         self.current_beat_index = 0  # Track which beat we're on
         self.beats_per_measure = 4  # Default 4/4 time
-        self.notes_queue = []  # List of (beat_time, note_events) tuples
+        self.channel_queues = {}  # Dictionary mapping channel -> list of beats with events
+        self.max_beats = 0  # Total number of beats in the song
         self.active_notes = set()  # Currently playing notes
+        self.beat_timer = None  # Timer for stopping notes after beat duration
         
         # Multiple track handling
         self.tracks = []  # List of track information: {'name': str, 'events': list, 'channel': int}
@@ -69,90 +71,79 @@ class DynamicMidiPlayer:
         print(f"[MIDI] ✓ FluidSynth initialized with soundfont: {os.path.basename(soundfont_path)}")
 
     def _organize_notes_by_beats(self):
-        """Organize MIDI messages into beats based on timing, preserving track information."""
+        """Organize MIDI messages into beats based on tick timing, with separate queues per channel."""
         if not self.midi:
             return
 
-        # Reset queues
-        self.notes_queue = []
+        # Reset queues and track data
+        self.channel_queues = {}  # Dictionary: channel -> {beat_index -> [events]}
+        self.max_beats = 0
         self.tracks = []
         self.track_muted = []
         self.track_volumes = []
         self.track_solo = []
         
-        # Calculate microseconds per beat from BPM
-        microseconds_per_beat = mido.bpm2tempo(self.current_bpm)
-        print("⚠️⚠️⚠️   the value is still brute forcing    ⚠️⚠️⚠️")
-        seconds_per_beat = microseconds_per_beat / 2000000.0
+        # Get ticks per beat from MIDI file
+        ticks_per_beat = self.midi.ticks_per_beat
+        print(f"[MIDI] Organizing beats: {self.current_bpm:.1f} BPM, {ticks_per_beat} ticks/beat")
         
         # Process each track separately
-        active_track_idx = 0  # Index for tracks with notes
-        for original_track_idx, track in enumerate(self.midi.tracks):
-            track_name = track.name if hasattr(track, 'name') and track.name else f"Track {original_track_idx}"
+        for track_idx, track in enumerate(self.midi.tracks):
+            track_name = track.name if hasattr(track, 'name') and track.name else f"Track {track_idx}"
             track_events_by_beat = {}  # Dictionary mapping beat_index -> list of events
-            current_time = 0
-            has_notes = False  # Flag to check if track has any note events
+            current_time_ticks = 0  # Accumulated time in MIDI ticks
             
-            # Determine the channel used by this track (default to original_track_idx % 16)
+            # Determine the channel used by this track (default to track_idx % 16)
             track_channel = None
             for msg in track:
                 if hasattr(msg, 'channel'):
                     track_channel = msg.channel
                     break
             if track_channel is None:
-                track_channel = original_track_idx % 16
+                track_channel = track_idx % 16
             
             # Process messages in this track
             for msg in track:
-                current_time += msg.time
-                beat_index = int(current_time / seconds_per_beat)
+                current_time_ticks += msg.time
+                # Calculate beat index based on ticks
+                beat_index = current_time_ticks // ticks_per_beat  # Integer division
                 
-                # Check if this track has any note events
-                if msg.type in ['note_on', 'note_off']:
-                    has_notes = True
+                # Update max beats
+                if beat_index > self.max_beats:
+                    self.max_beats = beat_index
                 
-                # Add message to the appropriate beat (use active_track_idx for events)
+                # Add message to the appropriate beat (use track_idx for events)
                 if msg.type in ['note_on', 'note_off', 'program_change', 'control_change', 'pitchwheel']:
                     if beat_index not in track_events_by_beat:
                         track_events_by_beat[beat_index] = []
-                    track_events_by_beat[beat_index].append((current_time, msg, active_track_idx))
+                    # Store: (tick_time, message, track_idx)
+                    track_events_by_beat[beat_index].append((current_time_ticks, msg, track_idx))
+                    
+                    # Also add to channel queue
+                    if track_channel not in self.channel_queues:
+                        self.channel_queues[track_channel] = {}
+                    if beat_index not in self.channel_queues[track_channel]:
+                        self.channel_queues[track_channel][beat_index] = []
+                    self.channel_queues[track_channel][beat_index].append((current_time_ticks, msg, track_idx))
             
-            # Skip tracks with no note events (metadata-only tracks)
-            if not has_notes:
-                print(f"[MIDI] Skipping track {original_track_idx} '{track_name}' (no note events)")
-                continue
-            
-            # Store track information
+            # Store track information for all tracks (including metadata-only tracks)
             self.tracks.append({
                 'name': track_name,
                 'events_by_beat': track_events_by_beat,
                 'channel': track_channel,
-                'original_index': original_track_idx
+                'original_index': track_idx
             })
             self.track_muted.append(False)
             self.track_volumes.append(1.0)
             self.track_solo.append(False)
-            active_track_idx += 1
         
-        # Merge all tracks into a unified beat queue
-        all_beat_indices = set()
-        for track in self.tracks:
-            all_beat_indices.update(track['events_by_beat'].keys())
+        # Sort events within each beat for each channel by tick time
+        for channel in self.channel_queues:
+            for beat_idx in self.channel_queues[channel]:
+                self.channel_queues[channel][beat_idx].sort(key=lambda x: x[0])
         
-        # Create a merged beat queue
-        for beat_idx in sorted(all_beat_indices):
-            beat_events = []
-            for track_idx, track in enumerate(self.tracks):
-                if beat_idx in track['events_by_beat']:
-                    for event in track['events_by_beat'][beat_idx]:
-                        beat_events.append(event)  # (time, msg, track_idx)
-            
-            # Sort events within the beat by time
-            beat_events.sort(key=lambda x: x[0])
-            beat_time = beat_idx * seconds_per_beat
-            self.notes_queue.append((beat_time, beat_events))
-        
-        print(f"[MIDI] Organized {len(self.notes_queue)} beats across {len(self.tracks)} tracks")
+        print(f"[MIDI] Organized {self.max_beats + 1} beats across {len(self.channel_queues)} channels")
+        print(f"[MIDI] Channels in use: {sorted(self.channel_queues.keys())}")
         for i, track in enumerate(self.tracks):
             print(f"  Track {i}: {track['name']} (Channel {track['channel']})")
 
@@ -239,17 +230,25 @@ class DynamicMidiPlayer:
         return original_bpm / self.current_bpm
 
     def _play_beat_events(self, beat_events):
-        """Play all notes in the given beat events, respecting track mute/solo/volume settings."""
+        """Play events in the beat asynchronously, respecting their timing and track mute/solo/volume settings."""
+        if not beat_events:
+            return
+        
         # Check if any track is in solo mode
         any_solo = any(self.track_solo)
         
-        # Collect all note_on events to play simultaneously
-        notes_to_play = []
-        other_events = []
+        # Get ticks per beat from MIDI file
+        ticks_per_beat = self.midi.ticks_per_beat
         
-        # First pass: organize events by type
+        # Calculate seconds per tick based on current BPM
+        microseconds_per_beat = mido.bpm2tempo(self.current_bpm)
+        seconds_per_beat = microseconds_per_beat / 1000000.0
+        seconds_per_tick = seconds_per_beat / ticks_per_beat
+        
+        # Group events by their tick time
+        events_by_tick = {}
         for event in beat_events:
-            current_time, msg, track_idx = event
+            tick_time, msg, track_idx = event
             
             # Check if this track should be played
             if track_idx >= len(self.tracks):
@@ -263,63 +262,98 @@ class DynamicMidiPlayer:
             if any_solo and not self.track_solo[track_idx]:
                 continue
             
-            # Apply track-specific volume
-            track_volume = self.track_volumes[track_idx]
+            if tick_time not in events_by_tick:
+                events_by_tick[tick_time] = []
+            events_by_tick[tick_time].append((msg, track_idx))
+        
+        # Get the first tick time as reference (start of beat)
+        if not events_by_tick:
+            return
+        
+        sorted_ticks = sorted(events_by_tick.keys())
+        first_tick = sorted_ticks[0]
+        
+        # Function to play events at a specific time offset
+        def play_events_at_tick(tick_time, events):
+            for msg, track_idx in events:
+                track_volume = self.track_volumes[track_idx]
+                
+                if msg.type == 'note_on' and msg.velocity > 0:
+                    # Apply both global volume and track volume
+                    combined_volume = self.volume * track_volume
+                    adjusted_velocity = min(127, int(msg.velocity * combined_volume))
+                    self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
+                    self.active_notes.add((msg.channel, msg.note))
+                    
+                elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
+                    # Handle note off
+                    self.fs.noteoff(msg.channel, msg.note)
+                    if (msg.channel, msg.note) in self.active_notes:
+                        self.active_notes.remove((msg.channel, msg.note))
+                        
+                elif msg.type == 'program_change':
+                    self.fs.program_change(msg.channel, msg.program)
+                    
+                elif msg.type == 'control_change':
+                    self.fs.cc(msg.channel, msg.control, msg.value)
+                    
+                elif msg.type == 'pitchwheel':
+                    self.fs.pitch_bend(msg.channel, msg.pitch)
+        
+        # Schedule events at each tick time using timers (non-blocking)
+        for tick_time in sorted_ticks:
+            # Calculate delay from the start of the beat
+            delay = (tick_time - first_tick) * seconds_per_tick
             
-            if msg.type == 'note_on' and msg.velocity > 0:
-                # Apply both global volume and track volume
-                combined_volume = self.volume * track_volume
-                adjusted_velocity = min(127, int(msg.velocity * combined_volume))
-                notes_to_play.append((msg.channel, msg.note, adjusted_velocity))
-            elif msg.type == 'note_off' or (msg.type == 'note_on' and msg.velocity == 0):
-                # Handle note off
-                if (msg.channel, msg.note) in self.active_notes:
-                    other_events.append(('note_off', msg.channel, msg.note))
-            elif msg.type == 'program_change':
-                other_events.append(('program_change', msg.channel, msg.program))
-            elif msg.type == 'control_change':
-                other_events.append(('control_change', msg.channel, msg.control, msg.value))
-            elif msg.type == 'pitchwheel':
-                other_events.append(('pitchwheel', msg.channel, msg.pitch))
-        
-        # Process note_off events first
-        for event in other_events:
-            if event[0] == 'note_off':
-                channel, note = event[1], event[2]
-                self.fs.noteoff(channel, note)
-                if (channel, note) in self.active_notes:
-                    self.active_notes.remove((channel, note))
-        
-        # Then play all new notes simultaneously
-        for channel, note, velocity in notes_to_play:
-            self.fs.noteon(channel, note, velocity)
-            self.active_notes.add((channel, note))
-        
-        # Finally, process other events (program changes, etc.)
-        for event in other_events:
-            if event[0] == 'program_change':
-                self.fs.program_change(event[1], event[2])
-            elif event[0] == 'control_change':
-                self.fs.cc(event[1], event[2], event[3])
-            elif event[0] == 'pitchwheel':
-                self.fs.pitch_bend(event[1], event[2])
+            events = events_by_tick[tick_time]
+            
+            if delay == 0:
+                # Play immediately
+                play_events_at_tick(tick_time, events)
+            else:
+                # Schedule to play after delay
+                timer = threading.Timer(delay, play_events_at_tick, args=(tick_time, events))
+                timer.start()
 
     def play_next_beat(self):
         """
-        Play the next beat in the sequence.
+        Play the next beat in the sequence asynchronously.
+        Plays events from all channels simultaneously for the current beat.
         Returns True if a beat was played, False if we've reached the end.
+        The beat will play for its full duration based on BPM without blocking.
         """
         if not self.running or self.paused:
             return False
 
-        if self.current_beat_index >= len(self.notes_queue):
+        if self.current_beat_index > self.max_beats:
             print("[MIDI] End of piece reached")
             self.stop()
             return False
 
-        # Play the current beat
-        _, beat_events = self.notes_queue[self.current_beat_index]
-        self._play_beat_events(beat_events)
+        # Cancel any existing beat timer
+        if self.beat_timer is not None:
+            self.beat_timer.cancel()
+            self.beat_timer = None
+
+        # Collect events from all channels for the current beat
+        beat_events = []
+        for channel in self.channel_queues:
+            if self.current_beat_index in self.channel_queues[channel]:
+                beat_events.extend(self.channel_queues[channel][self.current_beat_index])
+        
+        # Sort all events by tick time
+        beat_events.sort(key=lambda x: x[0])
+        
+        # Play the events if there are any
+        if beat_events:
+            self._play_beat_events(beat_events)
+        
+        # Calculate beat duration in seconds based on current BPM
+        beat_duration = 60.0 / self.current_bpm
+        
+        # Schedule notes to be silenced after the beat duration (asynchronously)
+        self.beat_timer = threading.Timer(beat_duration, self._all_notes_off)
+        self.beat_timer.start()
         
         # Increment beat counter
         self.current_beat_index += 1
@@ -357,6 +391,11 @@ class DynamicMidiPlayer:
             print("[MIDI] Already paused.")
             return
         
+        # Cancel any pending beat timer
+        if self.beat_timer is not None:
+            self.beat_timer.cancel()
+            self.beat_timer = None
+        
         self.paused = True
         self._all_notes_off()  # Silence any currently playing notes
         print("[MIDI] ⏸ Playback paused.")
@@ -382,6 +421,11 @@ class DynamicMidiPlayer:
         """Stop playback."""
         if not self.running:
             return
+        
+        # Cancel any pending beat timer
+        if self.beat_timer is not None:
+            self.beat_timer.cancel()
+            self.beat_timer = None
         
         self.running = False
         self.paused = False
@@ -458,6 +502,12 @@ class DynamicMidiPlayer:
         """Close FluidSynth and clean up resources."""
         if self.running:
             self.stop()
+        
+        # Cancel any pending beat timer
+        if self.beat_timer is not None:
+            self.beat_timer.cancel()
+            self.beat_timer = None
+        
         self.fs.delete()
         print("[MIDI] FluidSynth closed.")
 
