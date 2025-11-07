@@ -42,8 +42,6 @@ def get_args():
                        help='Primary conducting hand: "right" or "left" (default: right)')
     parser.add_argument("--num_hands", type=int, default=2,
                         help='Maximum number of hands to track (default: 2)')
-    parser.add_argument("--volume_control", type=str, choices=['secondary_hand', 'gesture'], default='gesture',
-                        help='Method for volume control: secondary_hand or gesture (default: gesture)')
     parser.add_argument("--velocity_smoothing", type=int, default=4,
                         help='Smoothing factor for velocity calculation (default: 4)')
     parser.add_argument("--neutral_velocity_threshold", type=float, default=0.24,
@@ -335,6 +333,240 @@ def draw_pattern_guide(image, conducting_analyzer):
     
     return image
 
+def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered_track_idx=None):
+    """
+    Draw a translucent overlay showing all tracks for volume control.
+    Appears when secondary hand is in "Pointer" mode.
+    
+    Args:
+        image: The image to draw on
+        player: The DynamicMidiPlayer instance
+        secondary_hand_pos: Tuple (x, y) of secondary hand position in pixels, or None
+        hovered_track_idx: Index of the track currently being hovered
+    
+    Returns:
+        Updated image
+    """
+    if player is None:
+        return image
+
+    h, w = image.shape[:2]
+    tracks_w_notes, track_count = player.get_tracks_with_notes()
+
+    if track_count == 0:
+        return image
+
+    # Create a translucent overlay
+    overlay = image.copy()
+    alpha = 0.4  # Transparency level (0.0 = fully transparent, 1.0 = opaque)
+
+    # Draw semi-transparent background covering the whole screen
+    cv.rectangle(overlay, (0, 0), (w, h), (40, 40, 40), -1)
+
+    # Calculate column dimensions
+    padding = 20
+    column_width = (w - padding * (track_count + 1)) // track_count
+
+    # Draw title at the top
+    title_text = "Track Volume Control - Pointer Mode Active"
+    title_size = cv.getTextSize(title_text, cv.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
+    title_x = (w - title_size[0]) // 2
+    cv.putText(overlay, title_text, (title_x, 50),
+              cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
+
+    # Draw instruction
+    instruction_text = "Point at a track to adjust its volume"
+    instruction_size = cv.getTextSize(instruction_text, cv.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+    instruction_x = (w - instruction_size[0]) // 2
+    cv.putText(overlay, instruction_text, (instruction_x, 85),
+              cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv.LINE_AA)
+
+    # Start position for track columns
+    column_start_y = 120
+    column_height = h - column_start_y - 50
+
+    # Draw each track column
+    for col_idx, track_idx in enumerate(tracks_w_notes):
+        track_info = player.get_track_info(track_idx)
+        if track_info is None:
+            continue
+
+        # Calculate column position (use col_idx for positioning, not track_idx)
+        column_x = padding + col_idx * (column_width + padding)
+
+        # Determine column color based on hover state
+        if hovered_track_idx == track_idx:
+            column_color = (100, 150, 255)  # Bright blue when hovered
+            border_color = (150, 200, 255)
+            border_thickness = 3
+        else:
+            column_color = (70, 70, 70)  # Dark gray
+            border_color = (120, 120, 120)
+            border_thickness = 2
+
+        # Draw column background
+        cv.rectangle(overlay, 
+                    (column_x, column_start_y),
+                    (column_x + column_width, column_start_y + column_height),
+                    column_color, -1)
+        cv.rectangle(overlay,
+                    (column_x, column_start_y),
+                    (column_x + column_width, column_start_y + column_height),
+                    border_color, border_thickness)
+
+        # Draw track name (wrapped if too long)
+        track_name = track_info['label']
+        max_chars_per_line = max(1, column_width // 10)  # Rough estimate
+
+        # Split long names into multiple lines
+        name_lines = []
+        if len(track_name) > max_chars_per_line:
+            words = track_name.split()
+            current_line = ""
+            for word in words:
+                if len(current_line + " " + word) <= max_chars_per_line:
+                    current_line += (" " if current_line else "") + word
+                else:
+                    if current_line:
+                        name_lines.append(current_line)
+                    current_line = word
+            if current_line:
+                name_lines.append(current_line)
+        else:
+            name_lines = [track_name]
+
+        # Limit to 3 lines maximum
+        name_lines = name_lines[:3]
+
+        # Draw track name (centered)
+        text_y = column_start_y + 40
+        for line in name_lines:
+            text_size = cv.getTextSize(line, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
+            text_x = column_x + (column_width - text_size[0]) // 2
+            cv.putText(overlay, line, (text_x, text_y),
+                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+            text_y += 25
+
+        # Draw volume bar (vertical) - Range: 50% to 150%
+        bar_width = 50
+        bar_height = column_height - 150
+        bar_x = column_x + (column_width - bar_width) // 2
+        bar_y = column_start_y + 120
+
+        # Draw bar background
+        cv.rectangle(overlay,
+                    (bar_x, bar_y),
+                    (bar_x + bar_width, bar_y + bar_height),
+                    (30, 30, 30), -1)
+        cv.rectangle(overlay,
+                    (bar_x, bar_y),
+                    (bar_x + bar_width, bar_y + bar_height),
+                    (150, 150, 150), 2)
+
+        # Draw reference lines
+        # 100% line (middle)
+        mid_y = bar_y + bar_height // 2
+        cv.line(overlay, (bar_x, mid_y), (bar_x + bar_width, mid_y),
+                (100, 100, 100), 1)
+
+        # Draw volume level mapped to 50%-150% range
+        track_volume = track_info['volume']
+        # Map volume from [0.5, 1.5] to [0, 1] for bar display
+        normalized_volume = (track_volume - 0.5) / (1.5 - 0.5)
+        normalized_volume = max(0.0, min(1.0, normalized_volume))
+        filled_height = int(bar_height * normalized_volume)
+
+        # Choose color based on volume level
+        if track_volume > 1.0:
+            bar_color = (0, 200, 255)  # Orange for above 100%
+        elif track_volume == 1.0:
+            bar_color = (0, 255, 0)  # Green for 100%
+        else:
+            bar_color = (100, 200, 100)  # Light green for below 100%
+
+        if filled_height > 0:
+            cv.rectangle(overlay,
+                        (bar_x + 2, bar_y + bar_height - filled_height),
+                        (bar_x + bar_width - 2, bar_y + bar_height - 2),
+                        bar_color, -1)
+
+        # Draw volume percentage
+        vol_text = f"{int(track_volume * 100)}%"
+        vol_text_size = cv.getTextSize(vol_text, cv.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
+        vol_text_x = column_x + (column_width - vol_text_size[0]) // 2
+        vol_text_y = bar_y + bar_height + 35
+
+        # Draw text with shadow for better visibility
+        cv.putText(overlay, vol_text, (vol_text_x + 2, vol_text_y + 2),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv.LINE_AA)
+        cv.putText(overlay, vol_text, (vol_text_x, vol_text_y),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv.LINE_AA)
+
+        # Draw min/max labels
+        min_label = "50%"
+        max_label = "150%"
+        label_size = 0.35
+
+        # Min label (bottom)
+        cv.putText(overlay, min_label, (bar_x - 5, bar_y + bar_height + 15),
+                  cv.FONT_HERSHEY_SIMPLEX, label_size, (150, 150, 150), 1, cv.LINE_AA)
+
+        # Max label (top)
+        cv.putText(overlay, max_label, (bar_x - 5, bar_y - 5),
+                  cv.FONT_HERSHEY_SIMPLEX, label_size, (150, 150, 150), 1, cv.LINE_AA)
+
+        # 100% label (middle reference line)
+        cv.putText(overlay, "100%", (bar_x + bar_width + 5, mid_y + 4),
+                  cv.FONT_HERSHEY_SIMPLEX, label_size, (150, 150, 150), 1, cv.LINE_AA)
+
+    # Draw secondary hand indicator if present
+    if secondary_hand_pos is not None:
+        cv.circle(overlay, secondary_hand_pos, 12, (255, 100, 255), -1)
+        cv.circle(overlay, secondary_hand_pos, 15, (255, 150, 255), 2)
+
+    # Blend the overlay with the original image
+    cv.addWeighted(overlay, alpha, image, 1 - alpha, 0, image)
+
+    return image
+
+def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
+    """
+    Determine which track column is being hovered in the overlay.
+    
+    Args:
+        player: The DynamicMidiPlayer instance
+        secondary_hand_pos: Tuple (x, y) of secondary hand position in pixels
+        image_shape: Tuple (height, width, channels) of the image
+    
+    Returns:
+        Track index being hovered, or None if not hovering over any column
+    """
+    if player is None or secondary_hand_pos is None:
+        return None
+
+    h, w = image_shape[:2]
+    hand_x, hand_y = secondary_hand_pos
+
+    # Check if hand is in the track column area
+    column_start_y = 120
+    column_height = h - column_start_y - 50
+
+    if hand_y < column_start_y or hand_y > column_start_y + column_height:
+        return None
+
+    # Calculate column dimensions
+    tracks_w_notes, track_count = player.get_tracks_with_notes()
+    padding = 20
+    column_width = (w - padding * (track_count + 1)) // track_count
+
+    # Check each track column
+    for col_idx, track_idx in enumerate(tracks_w_notes):
+        column_x = padding + col_idx * (column_width + padding)
+        if column_x <= hand_x <= column_x + column_width:
+            return track_idx
+
+    return None
+
 def draw_countdown_overlay(image, countdown_beats_detected, countdown_required, calibrated_bpm=None):
     """Draw countdown overlay showing beat calibration progress."""
     h, w = image.shape[:2]
@@ -503,20 +735,20 @@ def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
         return None
 
     # Initialize MIDI player
-    try:
-        player = DynamicMidiPlayer(soundfont_path=soundfont_path, bpm=initial_bpm)
-        success = player.load_file(midi_path)
+    # try:
+    player = DynamicMidiPlayer(soundfont_path=soundfont_path, bpm=initial_bpm)
+    success = player.load_file(midi_path)
 
-        if not success:
-            player.close()
-            raise Exception("DynamicMidiPlayer failed to load MIDI file.")
+    if not success:
+        player.close()
+        raise Exception("DynamicMidiPlayer failed to load MIDI file.")
 
-        print(f"Loaded MIDI file: {midi_path}")
-        print("Press SPACE to start/pause playback")
-    except Exception as e:
-        print(f"Error initializing MIDI player: {e}")
-        print("Continuing without audio playback...")
-        return None
+    print(f"Loaded MIDI file: {midi_path}")
+    print("Press SPACE to start/pause playback")
+    # except Exception as e:
+    #     print(f"Error initializing MIDI player: {e}")
+    #     print("Continuing without audio playback...")
+    #     return None
 
     return player
 
@@ -568,6 +800,10 @@ def main():
     from collections import deque
     primary_beat_history = deque(maxlen=40)  # Match history_length from analyzer
     secondary_beat_history = deque(maxlen=40)
+
+    # Track volume control state
+    last_hovered_track = None
+    last_pointer_y_position = None  # Track last Y position for delta calculation
     
     # Get and display pattern information
     pattern_info = conducting_analyzer.get_pattern_info()
@@ -588,9 +824,15 @@ def main():
     print("Beat Detection: Lowest point of downward motion (ictus)")
     print("Press ESC to exit")
     print("Press 'r' to reset conducting state")
+    print("Press 'h' to switch primary hand")
     print("Press '2', '3', or '4' to change time signature")
     print(f"Press SPACE to start countdown ({countdown_required} beats to calibrate tempo)")
-    print("-" * 50)
+    print("\nConducting:")
+    print("  Primary Hand   - Controls tempo and beats")
+    print("  Secondary Hand - Normal: Adjust global volume (all tracks)")
+    print("                   Pointer Gesture: Show track overlay + adjust individual tracks")
+    print("                   Move hand UP/DOWN to increase/decrease volume")
+    print("-" * 70)
 
     try:
         while True:
@@ -658,6 +900,8 @@ def main():
             # Extract positions for both hands
             primary_position = None
             secondary_position = None
+            secondary_hand_pixel_pos = None
+            is_pointer_mode = False
             h, w = frame.shape[:2]
             
             if primary_hand_results is not None and primary_hand_results.hand_detected:
@@ -673,6 +917,11 @@ def main():
                     finger_tip = landmark_list[8]
                     # Normalize position to 0-1
                     secondary_position = (finger_tip[0] / w, finger_tip[1] / h)
+                    # Get pixel position for UI interaction
+                    secondary_hand_pixel_pos = (finger_tip[0], finger_tip[1])
+
+                # Check if secondary hand is in "Pointer" mode (gesture ID 2)
+                is_pointer_mode = (secondary_hand_results.hand_sign_id == 2)
             
             # Update conducting analyzer with both hands
             conducting_frame, secondary_conducting_frame = conducting_analyzer.update_both_hands(
@@ -740,10 +989,11 @@ def main():
                 print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
                       f"tempo {conducting_frame.tempo_estimate} BPM")
                 
-                # Sync MIDI player tempo with conducting tempo (only if not neutral)
+                # Play the next beat when a conducting beat is detected (only if not neutral)
                 if player is not None and player.running and conducting_frame.tempo_estimate:
                     if conducting_frame.direction != Direction.NEUTRAL:
-                        player.set_bpm(conducting_frame.tempo_estimate)
+                            player.set_bpm(conducting_frame.tempo_estimate)
+                    player.play_next_beat()  # Add this method call to play the next beat
             
             # Pause/resume music based on conducting state
             if player is not None and player.running:
@@ -760,26 +1010,70 @@ def main():
                             print("Music resumed")
             
             # Adjust volume
-            # SECONDARY HAND - Based on secondary hand's vertical position
-            if args.volume_control == 'secondary_hand':
-                # Track sound effects (only from secondary hand)
-                if secondary_conducting_frame:
-                    # Only adjust volume if secondary hand is moving (not neutral)
-                    if secondary_conducting_frame.direction != Direction.NEUTRAL:
-                        # Adjust volume based on secondary hand position (higher = louder)
-                        tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
-                        vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
+            # Based on secondary hand's vertical position
+            # Track sound effects (only from secondary hand)
+            hovered_track_idx = None
+            if secondary_conducting_frame and player is not None:
+                if player is not None:
+                    if is_pointer_mode:
+                        # Pointer mode: Adjust individual track volume based on hover
+                        hovered_track_idx = get_hovered_track_in_overlay(player, secondary_hand_pixel_pos, frame.shape)
 
-                        if player is not None:
-                            if secondary_conducting_frame.position:
-                                player.set_volume(vol_level)
+                        current_y_position = secondary_conducting_frame.position[1]
 
-            # GESTURE - Based on conducting frame's volume estimate
-            elif args.volume_control == 'gesture':
-                if conducting_frame and conducting_frame.volume_estimate:
-                    if player is not None:
-                        player.set_volume(conducting_frame.volume_estimate)
-            
+                        if hovered_track_idx is not None:
+                            # Check if we just entered a new track
+                            if last_hovered_track != hovered_track_idx:
+                                # Just entered this track: Record initial position and current volume
+                                # DO NOT change the volume yet!
+                                track_info = player.get_track_info(hovered_track_idx)
+                                last_pointer_y_position = current_y_position
+                                last_hovered_track = hovered_track_idx
+                                # Store the initial volume when we entered (will be used as baseline)
+                                # Note: We're not changing volume here, just recording the state
+                            else:
+                                # Still in same track: Apply relative changes from entry point
+                                if last_pointer_y_position is not None:
+                                    # Calculate change in Y position from when we entered
+                                    delta_y = last_pointer_y_position - current_y_position
+
+                                    # Only apply if there's significant movement
+                                    if abs(delta_y) > 0.005:  # Threshold to avoid jitter
+                                        # Get current track volume
+                                        track_info = player.get_track_info(hovered_track_idx)
+                                        current_volume = track_info['volume']
+
+                                        # Apply delta change (delta_y is inverted because lower y = higher in image coords)
+                                        # Positive delta_y means pointer moved up (decrease y) → increase volume
+                                        # Scale delta to reasonable volume change
+                                        volume_change = delta_y * 2.0
+                                        new_volume = current_volume + volume_change
+
+                                        # Clamp to valid range [0.5, 1.5]
+                                        new_volume = max(0.5, min(1.5, new_volume))
+
+                                        # Apply new volume
+                                        player.set_track_volume(hovered_track_idx, new_volume)
+
+                                        # Update the recorded position to current position
+                                        # This makes the next delta relative to this new position
+                                        last_pointer_y_position = current_y_position
+                        else:
+                            # Not hovering over any track - clear the record
+                            last_hovered_track = None
+                            last_pointer_y_position = None
+                    else:
+                        # Normal mode: Adjust all tracks (global volume)
+                        # Reset pointer mode tracking when exiting pointer mode
+                        last_hovered_track = None
+                        last_pointer_y_position = None
+
+                        if secondary_conducting_frame.direction != Direction.NEUTRAL:
+                            # Calculate volume level from hand position
+                            tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
+                            vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
+                            player.set_volume(vol_level)
+
             # Draw point history trail with beat highlight (green circles for smoothed positions, yellow for beats)
             if conducting_frame:
                 display_image = draw_point_history(display_image, conducting_frame, list(primary_beat_history), args.velocity_smoothing, args.history_length)
@@ -813,6 +1107,10 @@ def main():
             # Draw controls overlay if music hasn't started yet or waiting for conducting (but not during countdown)
             elif not player.running or waiting_for_conducting:
                 display_image = draw_controls_overlay(display_image, waiting_for_conducting)
+            
+            # Draw track selection overlay if in pointer mode
+            if secondary_conducting_frame and is_pointer_mode:
+                display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, hovered_track_idx)
             
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
