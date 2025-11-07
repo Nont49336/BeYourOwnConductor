@@ -990,8 +990,7 @@ def main():
                       f"tempo {conducting_frame.tempo_estimate} BPM")
                 
                 # Play the next beat when a conducting beat is detected (only if not neutral)
-                if player is not None and player.running:
-                    if conducting_frame.tempo_estimate:
+                if player is not None and player.running and conducting_frame.tempo_estimate:
                     if conducting_frame.direction != Direction.NEUTRAL:
                             player.set_bpm(conducting_frame.tempo_estimate)
                     player.play_next_beat()  # Add this method call to play the next beat

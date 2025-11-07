@@ -208,6 +208,19 @@ class DynamicMidiPlayer:
         """Get the current volume level (0.0 to 2.0)."""
         return self.volume
     
+    def _calculate_time_scaling(self) -> float:
+        """
+        Calculate how much to scale the original MIDI timing.
+        Returns the factor to multiply sleep times by.
+        """
+        # Original BPM from MIDI file
+        original_bpm = mido.tempo2bpm(self.original_tempo)
+        
+        # Time scaling factor: original_bpm / current_bpm
+        # If current BPM is higher, we sleep less (play faster)
+        # If current BPM is lower, we sleep more (play slower)
+        return original_bpm / self.current_bpm
+
     def play_next_beat(self):
         """Queue the next beat to be played."""
         if not self.running or self.paused:
@@ -295,13 +308,13 @@ class DynamicMidiPlayer:
                         print("[MIDI] End of piece reached")
                         self.stop()
                         continue
-
+                    time_scale = self._calculate_time_scaling()
                     # Play the current beat
                     for msg in self.beat_chunks[self.current_beat_index]:
                         if not self.running or self.paused:
                             break
-                        
-                        time.sleep(msg.time)
+                    
+                        time.sleep(msg.time*time_scale)
                         if msg.type == 'note_on':
                             adjusted_velocity = min(int(msg.velocity * self.volume), 127)
                             self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
