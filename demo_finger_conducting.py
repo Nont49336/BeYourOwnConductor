@@ -1020,31 +1020,55 @@ def main():
             
             # Process frame with tracking system (MediaPipe or YOLO)
             if use_yolo:
-                # YOLO pose tracking for primary hand
-                primary_pose_result, _ = yolo_tracker.process_frame(frame)
-                primary_hand_results = None
+                # HYBRID MODE: YOLO for wrist positions + MediaPipe for gesture classification
+                # - YOLO provides both primary and secondary wrist positions (more stable)
+                # - MediaPipe provides gesture classification (pointer, closed hand, etc.)
                 
-                # Extract wrist position as "hand" results for compatibility
+                # YOLO pose tracking for both wrists
+                primary_pose_result, secondary_pose_result = yolo_tracker.process_frame(frame)
+                primary_hand_results = None
+                secondary_hand_results_from_yolo = None
+                
+                # Extract primary wrist position as "hand" results for compatibility
                 if primary_pose_result and primary_pose_result.wrist_position:
                     # Create a minimal result object for conducting analysis
                     class MinimalHandResult:
-                        def __init__(self, wrist_pos, timestamp):
+                        def __init__(self, wrist_pos, timestamp, hand_sign_id=0):
                             self.hand_detected = True
                             self.landmark_list = [[wrist_pos[0], wrist_pos[1]]] * 21  # Dummy landmarks
                             self.timestamp = timestamp
-                            self.hand_sign_id = 0  # Not used for YOLO
+                            self.hand_sign_id = hand_sign_id  # Will be updated from MediaPipe
                     
                     primary_hand_results = MinimalHandResult(
                         primary_pose_result.wrist_position,
                         primary_pose_result.timestamp
                     )
                 
-                # Draw YOLO pose visualization
+                # Extract secondary wrist position from YOLO
+                if secondary_pose_result and secondary_pose_result.wrist_position:
+                    secondary_hand_results_from_yolo = MinimalHandResult(
+                        secondary_pose_result.wrist_position,
+                        secondary_pose_result.timestamp
+                    )
+                
+                # Draw YOLO pose visualization for both wrists
                 if primary_pose_result:
                     display_image = yolo_tracker.get_annotated_frame(display_image, primary_pose_result)
+                if secondary_pose_result:
+                    display_image = yolo_tracker.get_annotated_frame(display_image, secondary_pose_result)
                 
-                # MediaPipe tracking for secondary hand (volume control)
-                secondary_hand_results, _ = hand_tracker.process_frame(frame)
+                # MediaPipe tracking ONLY for gesture classification (not position)
+                mediapipe_results, _ = hand_tracker.process_frame(frame)
+                
+                # Merge: Use YOLO wrist position but MediaPipe gesture classification
+                if secondary_hand_results_from_yolo is not None:
+                    # Start with YOLO position data
+                    secondary_hand_results = secondary_hand_results_from_yolo
+                    # Override gesture classification if MediaPipe detected a hand
+                    if mediapipe_results is not None and mediapipe_results.hand_detected:
+                        secondary_hand_results.hand_sign_id = mediapipe_results.hand_sign_id
+                else:
+                    secondary_hand_results = None
             else:
                 # MediaPipe hand tracking for both hands
                 primary_hand_results, secondary_hand_results = hand_tracker.process_frame(frame)
@@ -1207,10 +1231,10 @@ def main():
                     if secondary_conducting_frame.direction != Direction.NEUTRAL:
                         current_y_position = secondary_conducting_frame.position[1]
                         
-                        # Map Y position directly to volume (0.0 to 1.0 normalized -> 0.5 to 1.5 volume)
-                        # Top of screen (y=0.0) = max volume (1.5), bottom (y=1.0) = min volume (0.5)
-                        volume_from_position = 1.5 - (current_y_position * 1.0)  # Maps 0.0->1.5, 1.0->0.5
-                        volume_from_position = max(0.5, min(1.5, volume_from_position))
+                        # Map Y position directly to volume (0.0 to 1.0 normalized -> 0.5 to 1.8 volume)
+                        # Top of screen (y=0.0) = max volume (1.8), bottom (y=1.0) = min volume (0.5)
+                        volume_from_position = 2 - (current_y_position * 1.8)  # Maps 0.0->1.8, 1.0->0.5
+                        volume_from_position = max(0.2, min(1.8, volume_from_position))
                         
                         if selected_track_idx == "global":
                             # Adjust global volume for entire MIDI file
