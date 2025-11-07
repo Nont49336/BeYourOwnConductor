@@ -1254,11 +1254,7 @@ def main():
                 display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, 
                                                              hovered_track_idx, selected_track_idx, hover_start_time,
                                                              primary_hand_enum)
-            
-            # Draw selected track indicator when NOT in pointer mode (lower left corner)
-            if secondary_conducting_frame and not is_pointer_mode and selected_track_idx is not None:
-                display_image = draw_selected_track_indicator(display_image, player, selected_track_idx)
-            
+
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
     

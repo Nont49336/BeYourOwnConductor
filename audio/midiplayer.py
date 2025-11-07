@@ -172,30 +172,22 @@ class DynamicMidiPlayer:
                 'original_index': track_idx
             })
         
-        # Second pass: count instrument occurrences and assign numbers to duplicates
+        # Second pass: create labels with incremental numbering and store track information
         instrument_counts = {}
-        instrument_indices = {}
         
-        for data in track_data:
-            instrument_name = data['instrument']
-            if instrument_name:
-                if instrument_name not in instrument_counts:
-                    instrument_counts[instrument_name] = 0
-                    instrument_indices[instrument_name] = []
-                instrument_counts[instrument_name] += 1
-                instrument_indices[instrument_name].append(len(self.tracks))
-        
-        # Third pass: create labels with unique numbering
-        for data in track_data:
+        for i, data in enumerate(track_data):
             instrument_name = data['instrument']
             
             # Create a descriptive label for the track
             if instrument_name:
-                # If there are multiple tracks with the same instrument, add a number
+                # Increment count for this instrument
+                if instrument_name not in instrument_counts:
+                    instrument_counts[instrument_name] = 0
+                instrument_counts[instrument_name] += 1
+                
+                # Add number if this is not the first occurrence
                 if instrument_counts[instrument_name] > 1:
-                    # Find which occurrence this is (1-indexed)
-                    occurrence = instrument_indices[instrument_name].index(len(self.tracks)) + 1
-                    track_label = f"{instrument_name} {occurrence}"
+                    track_label = f"{instrument_name} {instrument_counts[instrument_name]}"
                 else:
                     track_label = instrument_name
             else:
