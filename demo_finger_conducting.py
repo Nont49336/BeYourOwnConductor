@@ -564,7 +564,7 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape, primar
 
     return None
 
-def draw_selected_track_indicator(image, player, selected_track_idx):
+def draw_selected_track_indicator(image, player, selected_track_idx, is_hand_closed=False):
     """
     Draw the currently selected track in the lower left corner.
     Shown when NOT in pointer mode.
@@ -573,6 +573,7 @@ def draw_selected_track_indicator(image, player, selected_track_idx):
         image: The image to draw on
         player: The DynamicMidiPlayer instance
         selected_track_idx: Index of selected track, "global", or None
+        is_hand_closed: Boolean indicating if the secondary hand is closed
     
     Returns:
         Updated image
@@ -585,7 +586,7 @@ def draw_selected_track_indicator(image, player, selected_track_idx):
     # Box dimensions and position
     padding = 10
     box_width = 250
-    box_height = 120
+    box_height = 140 if is_hand_closed else 120  # Taller if showing closed hand message
     box_x = padding
     box_y = h - box_height - padding
     
@@ -595,9 +596,10 @@ def draw_selected_track_indicator(image, player, selected_track_idx):
                 (40, 40, 40), -1)
     cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
     
-    # Draw border
+    # Draw border - red if hand is closed, green otherwise
+    border_color = (0, 0, 255) if is_hand_closed else (100, 255, 100)
     cv.rectangle(image, (box_x, box_y), (box_x + box_width, box_y + box_height),
-                (100, 255, 100), 2)
+                border_color, 2)
     
     # Draw title
     cv.putText(image, "Selected:", (box_x + 10, box_y + 25),
@@ -631,6 +633,11 @@ def draw_selected_track_indicator(image, player, selected_track_idx):
     # Draw current volume level
     cv.putText(image, f"Volume: {vol_percent}%", (box_x + 10, box_y + 105),
                 cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+    
+    # Draw "Volume Locked" message if hand is closed
+    if is_hand_closed:
+        cv.putText(image, "VOLUME LOCKED", (box_x + 10, box_y + 130),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv.LINE_AA)
     
     return image
 
@@ -1136,6 +1143,10 @@ def main():
             # Adjust volume
             # Based on secondary hand's vertical position
             # Track sound effects (only from secondary hand)
+            # Check if hand is closed (gesture ID 1) - defined early so it can be used later
+            is_hand_closed = (secondary_hand_results is not None and 
+                             secondary_hand_results.hand_sign_id == 1)
+            
             if secondary_conducting_frame and player is not None:
                 if is_pointer_mode:
                     # Pointer mode: Select track by hovering for 2 seconds
@@ -1155,8 +1166,9 @@ def main():
                             # Selection confirmed!
                             selected_track_idx = current_hovered
                             hover_start_time = None
-                else:
+                elif not is_hand_closed:
                     # Normal mode: Adjust volume of selected track/global using Y position
+                    # Only adjust volume if hand is NOT closed
                     # Reset hover tracking when not in pointer mode
                     hovered_track_idx = None
                     hover_start_time = None
@@ -1177,6 +1189,10 @@ def main():
                             track_info = player.get_track_info(selected_track_idx)
                             if track_info:
                                 player.set_track_volume(selected_track_idx, volume_from_position)
+                else:
+                    # Hand is closed - reset hover tracking but don't adjust volume
+                    hovered_track_idx = None
+                    hover_start_time = None
 
             # Draw point history trail with beat highlight (green circles for smoothed positions, yellow for beats)
             if conducting_frame:
@@ -1207,6 +1223,10 @@ def main():
             if countdown_active:
                 display_image = draw_countdown_overlay(display_image, countdown_beats_detected, 
                                                       countdown_required, calibrated_bpm)
+
+            # Draw selected track indicator when NOT in pointer mode (lower left corner)
+            if secondary_conducting_frame and not is_pointer_mode and selected_track_idx is not None:
+                display_image = draw_selected_track_indicator(display_image, player, selected_track_idx, is_hand_closed)
             
             # Draw controls overlay if music hasn't started yet or waiting for conducting (but not during countdown)
             elif not player.running or waiting_for_conducting:
@@ -1217,11 +1237,7 @@ def main():
                 display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, 
                                                              hovered_track_idx, selected_track_idx, hover_start_time,
                                                              hand_tracker.primary_hand)
-            
-            # Draw selected track indicator when NOT in pointer mode (lower left corner)
-            if secondary_conducting_frame and not is_pointer_mode and selected_track_idx is not None:
-                display_image = draw_selected_track_indicator(display_image, player, selected_track_idx)
-            
+             
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
     
