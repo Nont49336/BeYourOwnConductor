@@ -336,11 +336,9 @@ class DynamicMidiPlayer:
         # If current BPM is lower, we sleep more (play slower)
         # add threshold for robustness
         scale = self.last_bpm / self.current_bpm
-        
         if scale >= threshold:
-            self.last_bpm = self.current_bpm * threshold
             return threshold
-        self.last_bpm = self.current_bpm
+        
         return scale
 
     def play_next_beat(self):
@@ -436,8 +434,8 @@ class DynamicMidiPlayer:
                         if not self.running or self.paused:
                             break
                     
-                        time.sleep(msg.time*time_scale)
-                        # time.sleep(msg.time)
+                        # time.sleep(msg.time*time_scale)
+                        time.sleep(msg.time)
                         if msg.type == 'note_on':
                             adjusted_velocity = min(int(msg.velocity * self.volume), 127)
                             self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
