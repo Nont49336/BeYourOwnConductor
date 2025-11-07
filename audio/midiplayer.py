@@ -249,32 +249,26 @@ class DynamicMidiPlayer:
             print(f"[Error] File not found: {path}")
             return False
 
-        try:
-            midi = mido.MidiFile(path)
-            self.midi = midi
-            self.midi_path = path
-        
-            # Extract original tempo from MIDI file
-            self.original_tempo = 500000  # Default: 120 BPM (500000 microseconds per beat)
-            for track in midi.tracks:
-                for msg in track:
-                    if msg.type == 'set_tempo':
-                        self.original_tempo = msg.tempo
-                        original_bpm = mido.tempo2bpm(msg.tempo)
-                        print(f"[MIDI] Original tempo: {original_bpm:.1f} BPM")
-                        break
-            self._organize_tracks()
-            print("debugging")
-            self.chop_midi_into_beats()
-            # print(self.beat_chunks)
-            print(f"[MIDI] Loaded file: {os.path.basename(path)} "
-                    f"({len(midi.tracks)} tracks, {midi.length:.2f}s)")
-            return True
-        except Exception as e:
-            print(f"[Error] Failed to load MIDI file: {e}")
-            self.midi = None
-            self.midi_path = None
-            return False
+        midi = mido.MidiFile(path)
+        self.midi = midi
+        self.midi_path = path
+    
+        # Extract original tempo from MIDI file
+        self.original_tempo = 500000  # Default: 120 BPM (500000 microseconds per beat)
+        for track in midi.tracks:
+            for msg in track:
+                if msg.type == 'set_tempo':
+                    self.original_tempo = msg.tempo
+                    original_bpm = mido.tempo2bpm(msg.tempo)
+                    print(f"[MIDI] Original tempo: {original_bpm:.1f} BPM")
+                    break
+        self._organize_tracks()
+        print("debugging")
+        self.chop_midi_into_beats()
+        # print(self.beat_chunks)
+        print(f"[MIDI] Loaded file: {os.path.basename(path)} "
+                f"({len(midi.tracks)} tracks, {midi.length:.2f}s)")
+        return True
 
     def is_file_loaded(self) -> bool:
         """Check whether a MIDI file is loaded."""
