@@ -841,16 +841,28 @@ def main():
     use_yolo = args.use_yolo
     
     if use_yolo:
-        # Use YOLO pose tracking
+        # Use YOLO pose tracking for primary hand (conducting)
         use_right_hand = (args.primary_hand.lower() == 'right')
         yolo_tracker = YoloPoseTracking(
             model_path=args.yolo_model,
             use_right_hand=use_right_hand,
             confidence_threshold=0.3
         )
-        print(f"Using YOLO pose tracking (model: {args.yolo_model})")
+        print(f"Using YOLO pose tracking for primary hand (model: {args.yolo_model})")
+        
+        # Also initialize MediaPipe for secondary hand (volume control)
+        # Track only 1 hand for the non-primary hand
+        secondary_hand = Handedness.LEFT if use_right_hand else Handedness.RIGHT
+        hand_tracker = HandTracking(
+            max_num_hands=2,
+            primary_hand=secondary_hand,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5,
+            history_length=16
+        )
+        print(f"Using MediaPipe hand tracking for secondary hand ({secondary_hand.value})")
     else:
-        # Use MediaPipe hand tracking
+        # Use MediaPipe hand tracking for both hands
         hand_tracker = HandTracking(
             max_num_hands=args.num_hands,
             primary_hand=Handedness.from_str(args.primary_hand),
@@ -922,16 +934,11 @@ def main():
     print("Press 'h' to switch primary hand/wrist")
     print("Press '2', '3', or '4' to change time signature")
     print(f"Press SPACE to start countdown ({countdown_required} beats to calibrate tempo)")
-    if not use_yolo:
-        print("\nConducting:")
-        print("  Primary Hand   - Controls tempo and beats")
-        print("  Secondary Hand - Normal: Adjust volume of selected track/global")
-        print("                   Pointer Gesture: Select tracks (hover 2s to select)")
-        print("                   Move hand UP/DOWN to increase/decrease volume")
-    else:
-        print("\nConducting:")
-        print("  Wrist Position - Controls tempo and beats")
-        print("  (Volume control requires MediaPipe mode)")
+    print("\nConducting:")
+    print("  Primary Hand   - Controls tempo and beats")
+    print("  Secondary Hand - Normal: Adjust volume of selected track/global")
+    print("                   Pointer Gesture: Select tracks (hover 2s to select)")
+    print("                   Move hand UP/DOWN to increase/decrease volume")
     print("-" * 70)
 
     try:
@@ -1001,10 +1008,9 @@ def main():
             
             # Process frame with tracking system (MediaPipe or YOLO)
             if use_yolo:
-                # YOLO pose tracking
+                # YOLO pose tracking for primary hand
                 primary_pose_result, _ = yolo_tracker.process_frame(frame)
                 primary_hand_results = None
-                secondary_hand_results = None
                 
                 # Extract wrist position as "hand" results for compatibility
                 if primary_pose_result and primary_pose_result.wrist_position:
@@ -1024,8 +1030,11 @@ def main():
                 # Draw YOLO pose visualization
                 if primary_pose_result:
                     display_image = yolo_tracker.get_annotated_frame(display_image, primary_pose_result)
+                
+                # MediaPipe tracking for secondary hand (volume control)
+                secondary_hand_results, _ = hand_tracker.process_frame(frame)
             else:
-                # MediaPipe hand tracking
+                # MediaPipe hand tracking for both hands
                 primary_hand_results, secondary_hand_results = hand_tracker.process_frame(frame)
             
             # Extract positions for both hands
@@ -1150,7 +1159,10 @@ def main():
             if secondary_conducting_frame and player is not None:
                 if is_pointer_mode:
                     # Pointer mode: Select track by hovering for 2 seconds
-                    current_hovered = get_hovered_track_in_overlay(player, secondary_hand_pixel_pos, frame.shape, hand_tracker.primary_hand)
+                    # For YOLO mode, use the secondary hand (opposite of YOLO's tracked hand)
+                    primary_for_ui = yolo_tracker.use_right_hand if use_yolo else hand_tracker.primary_hand == Handedness.RIGHT
+                    primary_hand_enum = Handedness.RIGHT if primary_for_ui else Handedness.LEFT
+                    current_hovered = get_hovered_track_in_overlay(player, secondary_hand_pixel_pos, frame.shape, primary_hand_enum)
                     
                     if current_hovered != hovered_track_idx:
                         # Started hovering on a new track/option
@@ -1217,7 +1229,9 @@ def main():
             # Draw pattern guide
             display_image = draw_pattern_guide(display_image, conducting_analyzer)
             if guide_enabled:
-                display_image = draw_conducting_path(display_image, conducting_analyzer.beats_per_measure, hand_tracker.primary_hand)
+                # For YOLO mode, determine primary hand from yolo_tracker
+                primary_for_guide = Handedness.RIGHT if (use_yolo and yolo_tracker.use_right_hand) or (not use_yolo and hand_tracker.primary_hand == Handedness.RIGHT) else Handedness.LEFT
+                display_image = draw_conducting_path(display_image, conducting_analyzer.beats_per_measure, primary_for_guide)
             
             # Draw countdown overlay if active
             if countdown_active:
@@ -1234,10 +1248,17 @@ def main():
             
             # Draw track selection overlay if in pointer mode
             if secondary_conducting_frame and is_pointer_mode:
+                # For YOLO mode, use the secondary hand (opposite of YOLO's tracked hand)
+                primary_for_ui = yolo_tracker.use_right_hand if use_yolo else hand_tracker.primary_hand == Handedness.RIGHT
+                primary_hand_enum = Handedness.RIGHT if primary_for_ui else Handedness.LEFT
                 display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, 
                                                              hovered_track_idx, selected_track_idx, hover_start_time,
-                                                             hand_tracker.primary_hand)
-             
+                                                             primary_hand_enum)
+            
+            # Draw selected track indicator when NOT in pointer mode (lower left corner)
+            if secondary_conducting_frame and not is_pointer_mode and selected_track_idx is not None:
+                display_image = draw_selected_track_indicator(display_image, player, selected_track_idx)
+            
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
     
