@@ -735,20 +735,20 @@ def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
         return None
 
     # Initialize MIDI player
-    try:
-        player = DynamicMidiPlayer(soundfont_path=soundfont_path, bpm=initial_bpm)
-        success = player.load_file(midi_path)
+    # try:
+    player = DynamicMidiPlayer(soundfont_path=soundfont_path, bpm=initial_bpm)
+    success = player.load_file(midi_path)
 
-        if not success:
-            player.close()
-            raise Exception("DynamicMidiPlayer failed to load MIDI file.")
+    if not success:
+        player.close()
+        raise Exception("DynamicMidiPlayer failed to load MIDI file.")
 
-        print(f"Loaded MIDI file: {midi_path}")
-        print("Press SPACE to start/pause playback")
-    except Exception as e:
-        print(f"Error initializing MIDI player: {e}")
-        print("Continuing without audio playback...")
-        return None
+    print(f"Loaded MIDI file: {midi_path}")
+    print("Press SPACE to start/pause playback")
+    # except Exception as e:
+    #     print(f"Error initializing MIDI player: {e}")
+    #     print("Continuing without audio playback...")
+    #     return None
 
     return player
 
@@ -989,10 +989,12 @@ def main():
                 print(f"Beat {conducting_frame.beat_index}/{conducting_analyzer.beats_per_measure}: "
                       f"tempo {conducting_frame.tempo_estimate} BPM")
                 
-                # Sync MIDI player tempo with conducting tempo (only if not neutral)
-                if player is not None and player.running and conducting_frame.tempo_estimate:
+                # Play the next beat when a conducting beat is detected (only if not neutral)
+                if player is not None and player.running:
+                    if conducting_frame.tempo_estimate:
                     if conducting_frame.direction != Direction.NEUTRAL:
-                        player.set_bpm(conducting_frame.tempo_estimate)
+                            player.set_bpm(conducting_frame.tempo_estimate)
+                    player.play_next_beat()  # Add this method call to play the next beat
             
             # Pause/resume music based on conducting state
             if player is not None and player.running:

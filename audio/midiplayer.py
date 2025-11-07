@@ -1,6 +1,7 @@
 import mido
 import fluidsynth
 import threading
+from queue import Queue, Empty
 import time
 import os
 import platform
@@ -36,6 +37,11 @@ class DynamicMidiPlayer:
         # Multiple track handling
         self.tracks = []  # List of track information: {'name': str, 'events': list, 'channel': int}
         self.track_volumes = []  # List of volume multipliers for each track
+        self.beat_chunks = {}
+        self.current_beat_index = 0
+        self.beat_queue = Queue()
+        self.beat_thread = None
+        self.beat_thread_running = False
         
         os_name = platform.system()
         if os_name == "Windows":
@@ -98,6 +104,39 @@ class DynamicMidiPlayer:
         for i, track in enumerate(self.tracks):
             print(f"  Track {i}: {track['name']} (Channel {track['channel']})")
 
+    def chop_midi_into_beats(self):
+        current_tempo = self.original_tempo #might be good to use adaptive tempo to adjsut the 
+        current_ticks=0
+        self.beat_chunks = {} 
+        print("[DEBUG] Starting to chop MIDI into beats")
+        print("[DEBUG] MIDI file details:", self.midi)
+        # Helper function to convert ticks → beats
+        def ticks_to_beats(ticks):
+            return ticks / (self.midi.ticks_per_beat)
+        
+        # def time_to_ticks(microsecond):
+            # mido.tick2second
+            # return mido.second2tick(microsecond)
+
+        # Scan all messages
+        for msg in self.midi:
+            time = mido.second2tick(msg.time,self.midi.ticks_per_beat,current_tempo)
+            current_ticks += time # accumulate delta times
+            # remap_tick = mido.second2tick(msg.time,midi.ticks_per_beat,self.original_tempo)
+            # # Update tempo or time signature if they appear
+            if msg.type == 'set_tempo':
+                current_tempo = msg.tempo  # microseconds per beat
+            # elif msg.type == 'time_signature':
+            #     beats_per_bar = msg.numerator
+            # Compute current beat number (integer index)
+            beat_index = int(ticks_to_beats(current_ticks))
+            
+            # Add message to that beat’s list
+            if beat_index not in self.beat_chunks:
+                self.beat_chunks[beat_index] = []
+            self.beat_chunks[beat_index].append(msg)
+
+        # self.beat_chunks = sorted(self.beat_chunks.keys())
 
     def load_file(self, path: str) -> bool:
         """Load a MIDI file into the player. Returns True if successful."""
@@ -109,7 +148,7 @@ class DynamicMidiPlayer:
             midi = mido.MidiFile(path)
             self.midi = midi
             self.midi_path = path
-            
+        
             # Extract original tempo from MIDI file
             self.original_tempo = 500000  # Default: 120 BPM (500000 microseconds per beat)
             for track in midi.tracks:
@@ -119,14 +158,12 @@ class DynamicMidiPlayer:
                         original_bpm = mido.tempo2bpm(msg.tempo)
                         print(f"[MIDI] Original tempo: {original_bpm:.1f} BPM")
                         break
-                if self.original_tempo != 500000:
-                    break
-            
-            # Organize tracks
             self._organize_tracks()
-            
+            print("debugging")
+            self.chop_midi_into_beats()
+            # print(self.beat_chunks)
             print(f"[MIDI] Loaded file: {os.path.basename(path)} "
-                  f"({len(midi.tracks)} tracks, {midi.length:.2f}s)")
+                    f"({len(midi.tracks)} tracks, {midi.length:.2f}s)")
             return True
         except Exception as e:
             print(f"[Error] Failed to load MIDI file: {e}")
@@ -170,19 +207,19 @@ class DynamicMidiPlayer:
     def get_volume(self) -> float:
         """Get the current volume level (0.0 to 2.0)."""
         return self.volume
+    
+    def play_next_beat(self):
+        """Queue the next beat to be played."""
+        if not self.running or self.paused:
+            return False
 
-    def _calculate_time_scaling(self) -> float:
-        """
-        Calculate how much to scale the original MIDI timing.
-        Returns the factor to multiply sleep times by.
-        """
-        # Original BPM from MIDI file
-        original_bpm = mido.tempo2bpm(self.original_tempo)
-        
-        # Time scaling factor: original_bpm / current_bpm
-        # If current BPM is higher, we sleep less (play faster)
-        # If current BPM is lower, we sleep more (play slower)
-        return original_bpm / self.current_bpm
+        if self.current_beat_index >= len(self.beat_chunks.keys()):
+            print("[MIDI] End of piece reached")
+            self.stop()
+            return False
+                # Queue the beat to be played
+        self.beat_queue.put(True)
+        return True
 
     def _get_track_for_channel(self, channel: int) -> int:
         """Find the track index that uses this channel (returns first match or -1 if none)."""
@@ -197,6 +234,8 @@ class DynamicMidiPlayer:
             return 1.0  # Unknown track, use full volume
         return self.track_volumes[track_idx]
 
+
+    
     def _playback_loop(self):
         """Internal playback thread."""
         if not self.is_file_loaded():
@@ -245,6 +284,42 @@ class DynamicMidiPlayer:
         self.running = False  # Mark as finished
         print("[MIDI] Playback finished.")
 
+    def _beat_player_thread(self):
+        """Thread that handles playing beats from the queue."""
+        while self.beat_thread_running:
+            try:
+                # Wait for next beat request with a timeout
+                beat_requested = self.beat_queue.get(timeout=0.1)
+                if beat_requested and self.running and not self.paused:
+                    if self.current_beat_index >= len(self.beat_chunks.keys()):
+                        print("[MIDI] End of piece reached")
+                        self.stop()
+                        continue
+
+                    # Play the current beat
+                    for msg in self.beat_chunks[self.current_beat_index]:
+                        if not self.running or self.paused:
+                            break
+                        
+                        time.sleep(msg.time)
+                        if msg.type == 'note_on':
+                            adjusted_velocity = min(int(msg.velocity * self.volume), 127)
+                            self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
+                        elif msg.type == 'note_off':
+                            self.fs.noteoff(msg.channel, msg.note)
+                        elif msg.type == 'program_change':
+                            self.fs.program_change(msg.channel, msg.program)
+                        elif msg.type == 'control_change':
+                            self.fs.cc(msg.channel, msg.control, msg.value)
+                        elif msg.type == 'pitchwheel':
+                            self.fs.pitch_bend(msg.channel, msg.pitch)
+                    
+                    # Increment beat counter
+                    self.current_beat_index += 1
+
+            except Empty:
+                continue  # No beat requested, continue waiting
+
     def _all_notes_off(self):
         """Send all notes off and all sound off messages to all channels."""
         for channel in range(16):
@@ -287,7 +362,7 @@ class DynamicMidiPlayer:
         self.fade_thread.start()
 
     def start(self):
-        """Start playback in a background thread."""
+        """Start playback system."""
         if not self.is_file_loaded():
             print("[Error] No MIDI file loaded. Load a file before playing.")
             return
@@ -298,9 +373,14 @@ class DynamicMidiPlayer:
 
         self.running = True
         self.paused = False
-        self.thread = threading.Thread(target=self._playback_loop, daemon=True)
-        self.thread.start()
-        print(f"[MIDI] ▶ Playback started at {self.current_bpm:.1f} BPM: {os.path.basename(self.midi_path)}")
+        self.current_beat_index = 0
+        
+        # Start the beat player thread
+        self.beat_thread_running = True
+        self.beat_thread = threading.Thread(target=self._beat_player_thread, daemon=True)
+        self.beat_thread.start()
+        
+        print(f"[MIDI] ▶ Ready to play at {self.current_bpm:.1f} BPM: {os.path.basename(self.midi_path)}")
 
     def pause(self):
         """Pause playback with a smooth fade-down effect. Call resume() to continue."""
@@ -349,10 +429,17 @@ class DynamicMidiPlayer:
         
         self.running = False
         self.paused = False
+        self.beat_thread_running = False
         self._all_notes_off()
         
-        if self.thread:
-            self.thread.join()
+        # Clear the beat queue
+        while not self.beat_queue.empty():
+            self.beat_queue.get()
+        
+        if self.beat_thread:
+            self.beat_thread.join()
+            self.beat_thread = None
+            
         print("[MIDI] ■ Playback stopped.")
 
     # Track-specific controls
