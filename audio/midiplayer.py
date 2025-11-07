@@ -79,7 +79,6 @@ class DynamicMidiPlayer:
         self.midi_path = None
         self.original_tempo = None  # microseconds per beat from MIDI file
         self.current_bpm = bpm
-        self.last_bpm = bpm
         self.volume = max(0.0, min(2.0, volume))  # Clamp volume between 0.0 and 2.0
         self.target_volume = self.volume  # Target volume for fading
         self.fade_active = False  # Whether a fade is in progress
@@ -322,24 +321,24 @@ class DynamicMidiPlayer:
         """Get the current volume level (0.0 to 2.0)."""
         return self.volume
     
-    def _calculate_time_scaling(self) -> float:
-        """
-        Calculate how much to scale the original MIDI timing.
-        Returns the factor to multiply sleep times by.
-        """
-        threshold = 0.2
-        # Original BPM from MIDI file
-        # original_bpm = mido.tempo2bpm(self.original_tempo)
-        # current_bpm = self.current_bpm
-        # Time scaling factor: original_bpm / current_bpm
-        # If current BPM is higher, we sleep less (play faster)
-        # If current BPM is lower, we sleep more (play slower)
-        # add threshold for robustness
-        scale = self.last_bpm / self.current_bpm
-        if scale >= threshold:
-            return threshold
+    # def _calculate_time_scaling(self) -> float:
+    #     """
+    #     Calculate how much to scale the original MIDI timing.
+    #     Returns the factor to multiply sleep times by.
+    #     """
+    #     threshold = 0.1
+    #     # Original BPM from MIDI file
+    #     # original_bpm = mido.tempo2bpm(self.original_tempo)
+    #     current_bpm = self.current_bpm
+    #     # Time scaling factor: original_bpm / current_bpm
+    #     # If current BPM is higher, we sleep less (play faster)
+    #     # If current BPM is lower, we sleep more (play slower)
+    #     # add threshold for robustness
+    #     scale = original_bpm / self.current_bpm
+    #     if scale >= threshold:
+    #         return threshold
         
-        return scale
+    #     return min(original_bpm / self.current_bpm,1)
 
     def play_next_beat(self):
         """Queue the next beat to be played."""
@@ -428,7 +427,7 @@ class DynamicMidiPlayer:
                         print("[MIDI] End of piece reached")
                         self.stop()
                         continue
-                    time_scale = self._calculate_time_scaling()
+                    # time_scale = self._calculate_time_scaling()
                     # Play the current beat
                     for msg in self.beat_chunks[self.current_beat_index]:
                         if not self.running or self.paused:
