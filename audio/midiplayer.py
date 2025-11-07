@@ -410,12 +410,18 @@ class DynamicMidiPlayer:
             
             # Apply BPM scaling to timing
             # time_scale = self._calculate_time_scaling()
-            time.sleep(msg.time * time_scale)
+            # time.sleep(msg.time * time_scale)
         
         self._all_notes_off()
         self.running = False  # Mark as finished
         print("[MIDI] Playback finished.")
 
+    def _calculate_time_scaling(self):
+        original_bpm = mido.tempo2bpm(self.original_tempo)
+        scale = original_bpm / self.current_bpm
+        print(f"[DEBUG] Scale {scale} finished.")
+        return scale
+    
     def _beat_player_thread(self):
         """Thread that handles playing beats from the queue."""
         while self.beat_thread_running:
@@ -427,16 +433,16 @@ class DynamicMidiPlayer:
                         print("[MIDI] End of piece reached")
                         self.stop()
                         continue
-                    # time_scale = self._calculate_time_scaling()
+                    time_scale = self._calculate_time_scaling()
                     # Play the current beat
                     for msg in self.beat_chunks[self.current_beat_index]:
                         if not self.running or self.paused:
                             break
-                    
-                        # time.sleep(msg.time*time_scale)
-                        time.sleep(msg.time)
 
-                        # Determine which track this message belongs to (if it has a channel)
+                        time.sleep(msg.time*time_scale)
+                        # time.sleep(msg.time)
+                        
+                         # Determine which track this message belongs to (if it has a channel)
                         track_idx = -1
                         if hasattr(msg, 'channel'):
                             track_idx = self._get_track_for_channel(msg.channel)
