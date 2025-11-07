@@ -13,6 +13,7 @@ import os
 import time
 
 from vision_modules.hand_tracking import Handedness, HandTracking
+from vision_modules.yolo_pose_tracking import YoloPoseTracking, YoloPoseResult
 from vision_modules.conducting_protocol import (
     FingerConductingAnalyzer,
     ConductingFrame,
@@ -49,6 +50,10 @@ def get_args():
                         help='Neutral velocity threshold for gesture volume control (default: 0.3)')
     parser.add_argument("--history_length", type=int, default=40,
                         help='Length of position history for conducting analysis (default: 40)')
+    parser.add_argument("--use_yolo", action='store_true',
+                        help='Use YOLO pose tracking instead of MediaPipe hand tracking')
+    parser.add_argument("--yolo_model", type=str, default='yolo11s-pose.pt',
+                        help='YOLO pose model path (default: yolo11s-pose.pt)')
     
     return parser.parse_args()
 
@@ -823,14 +828,30 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, args.height)
     
-    # Initialize hand tracking
-    hand_tracker = HandTracking(
-        max_num_hands=args.num_hands,
-        primary_hand=Handedness.from_str(args.primary_hand),
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.5,
-        history_length=16
-    )
+    # Initialize tracking system (MediaPipe or YOLO)
+    hand_tracker = None
+    yolo_tracker = None
+    use_yolo = args.use_yolo
+    
+    if use_yolo:
+        # Use YOLO pose tracking
+        use_right_hand = (args.primary_hand.lower() == 'right')
+        yolo_tracker = YoloPoseTracking(
+            model_path=args.yolo_model,
+            use_right_hand=use_right_hand,
+            confidence_threshold=0.3
+        )
+        print(f"Using YOLO pose tracking (model: {args.yolo_model})")
+    else:
+        # Use MediaPipe hand tracking
+        hand_tracker = HandTracking(
+            max_num_hands=args.num_hands,
+            primary_hand=Handedness.from_str(args.primary_hand),
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.5,
+            history_length=16
+        )
+        print("Using MediaPipe hand tracking")
     
     # Initialize conducting analyzer with improved neutral detection
     conducting_analyzer = FingerConductingAnalyzer(
@@ -882,18 +903,28 @@ def main():
     calibrated_bpm = None
     
     print("Finger Conducting Demo")
+    print(f"Tracking Mode: {'YOLO Pose' if use_yolo else 'MediaPipe Hand'}")
+    if use_yolo:
+        print(f"Tracking: {'Right' if yolo_tracker.use_right_hand else 'Left'} wrist")
+    else:
+        print(f"Primary Hand: {hand_tracker.primary_hand.value}")
     print(f"Time Signature: {pattern_info['time_signature']}")
     print("Beat Detection: Lowest point of downward motion (ictus)")
     print("Press ESC to exit")
     print("Press 'r' to reset conducting state")
-    print("Press 'h' to switch primary hand")
+    print("Press 'h' to switch primary hand/wrist")
     print("Press '2', '3', or '4' to change time signature")
     print(f"Press SPACE to start countdown ({countdown_required} beats to calibrate tempo)")
-    print("\nConducting:")
-    print("  Primary Hand   - Controls tempo and beats")
-    print("  Secondary Hand - Normal: Adjust volume of selected track/global")
-    print("                   Pointer Gesture: Select tracks (hover 2s to select)")
-    print("                   Move hand UP/DOWN to increase/decrease volume")
+    if not use_yolo:
+        print("\nConducting:")
+        print("  Primary Hand   - Controls tempo and beats")
+        print("  Secondary Hand - Normal: Adjust volume of selected track/global")
+        print("                   Pointer Gesture: Select tracks (hover 2s to select)")
+        print("                   Move hand UP/DOWN to increase/decrease volume")
+    else:
+        print("\nConducting:")
+        print("  Wrist Position - Controls tempo and beats")
+        print("  (Volume control requires MediaPipe mode)")
     print("-" * 70)
 
     try:
@@ -940,9 +971,14 @@ def main():
                 guide_enabled = not guide_enabled
                 print(f"\nPattern guide {'enabled' if guide_enabled else 'disabled'}")
             elif key == ord('h'):  # Switch primary hand
-                new_primary_hand = Handedness.LEFT if hand_tracker.primary_hand == Handedness.RIGHT else Handedness.RIGHT
-                hand_tracker.set_primary_hand(new_primary_hand)
-                print(f"\nSwitched primary hand to: {hand_tracker.primary_hand.value}")
+                if use_yolo:
+                    # Toggle YOLO wrist tracking
+                    yolo_tracker.set_tracking_hand(not yolo_tracker.use_right_hand)
+                else:
+                    # Toggle MediaPipe hand tracking
+                    new_primary_hand = Handedness.LEFT if hand_tracker.primary_hand == Handedness.RIGHT else Handedness.RIGHT
+                    hand_tracker.set_primary_hand(new_primary_hand)
+                    print(f"\nSwitched primary hand to: {hand_tracker.primary_hand.value}")
             
             # Capture frame
             ret, frame = cap.read()
@@ -956,8 +992,34 @@ def main():
             # Create display image
             display_image = copy.deepcopy(frame)
             
-            # Process frame with hand tracking
-            primary_hand_results, secondary_hand_results = hand_tracker.process_frame(frame)
+            # Process frame with tracking system (MediaPipe or YOLO)
+            if use_yolo:
+                # YOLO pose tracking
+                primary_pose_result, _ = yolo_tracker.process_frame(frame)
+                primary_hand_results = None
+                secondary_hand_results = None
+                
+                # Extract wrist position as "hand" results for compatibility
+                if primary_pose_result and primary_pose_result.wrist_position:
+                    # Create a minimal result object for conducting analysis
+                    class MinimalHandResult:
+                        def __init__(self, wrist_pos, timestamp):
+                            self.hand_detected = True
+                            self.landmark_list = [[wrist_pos[0], wrist_pos[1]]] * 21  # Dummy landmarks
+                            self.timestamp = timestamp
+                            self.hand_sign_id = 0  # Not used for YOLO
+                    
+                    primary_hand_results = MinimalHandResult(
+                        primary_pose_result.wrist_position,
+                        primary_pose_result.timestamp
+                    )
+                
+                # Draw YOLO pose visualization
+                if primary_pose_result:
+                    display_image = yolo_tracker.get_annotated_frame(display_image, primary_pose_result)
+            else:
+                # MediaPipe hand tracking
+                primary_hand_results, secondary_hand_results = hand_tracker.process_frame(frame)
             
             # Extract positions for both hands
             primary_position = None
@@ -1172,7 +1234,10 @@ def main():
             print("MIDI player closed")
         cap.release()
         cv.destroyAllWindows()
-        hand_tracker.close()
+        if hand_tracker is not None:
+            hand_tracker.close()
+        if yolo_tracker is not None:
+            yolo_tracker.close()
         print("\nApplication closed")
 
 
