@@ -198,20 +198,20 @@ def load_player_files(midi_path: str, soundfont_path: str, initial_bpm: int):
         return None
 
     # Initialize MIDI player
-    try:
-        player = DynamicMidiPlayer(soundfont_path=soundfont_path, bpm=initial_bpm)
-        success = player.load_file(midi_path)
+    # try:
+    player = DynamicMidiPlayer(soundfont_path=soundfont_path, bpm=initial_bpm)
+    success = player.load_file(midi_path)
 
-        if not success:
-            player.close()
-            raise Exception("DynamicMidiPlayer failed to load MIDI file.")
+    if not success:
+        player.close()
+        raise Exception("DynamicMidiPlayer failed to load MIDI file.")
 
-        print(f"Loaded MIDI file: {midi_path}")
-        print("Press SPACE to start/pause playback")
-    except Exception as e:
-        print(f"Error initializing MIDI player: {e}")
-        print("Continuing without audio playback...")
-        return None
+    print(f"Loaded MIDI file: {midi_path}")
+    print("Press SPACE to start/pause playback")
+    # except Exception as e:
+    #     print(f"Error initializing MIDI player: {e}")
+    #     print("Continuing without audio playback...")
+    #     return None
 
     return player
 
