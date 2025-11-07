@@ -333,7 +333,7 @@ def draw_pattern_guide(image, conducting_analyzer):
     
     return image
 
-def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered_track_idx=None):
+def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered_track_idx=None, primary_hand=Handedness.RIGHT):
     """
     Draw a translucent overlay showing all tracks for volume control.
     Appears when secondary hand is in "Pointer" mode.
@@ -343,6 +343,7 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
         player: The DynamicMidiPlayer instance
         secondary_hand_pos: Tuple (x, y) of secondary hand position in pixels, or None
         hovered_track_idx: Index of the track currently being hovered
+        primary_hand: Handedness enum indicating which hand is primary (default: RIGHT)
     
     Returns:
         Updated image
@@ -356,28 +357,39 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
     if track_count == 0:
         return image
 
+    # Calculate UI bounds (60% of screen opposite to primary hand)
+    ui_width = int(w * 0.6)
+    if primary_hand == Handedness.RIGHT:
+        # Primary hand is right, so UI spans left 60%
+        ui_start_x = 0
+        ui_end_x = ui_width
+    else:
+        # Primary hand is left, so UI spans right 60%
+        ui_start_x = w - ui_width
+        ui_end_x = w
+
     # Create a translucent overlay
     overlay = image.copy()
     alpha = 0.4  # Transparency level (0.0 = fully transparent, 1.0 = opaque)
 
-    # Draw semi-transparent background covering the whole screen
-    cv.rectangle(overlay, (0, 0), (w, h), (40, 40, 40), -1)
+    # Draw semi-transparent background covering only the UI area
+    cv.rectangle(overlay, (ui_start_x, 0), (ui_end_x, h), (40, 40, 40), -1)
 
-    # Calculate column dimensions
+    # Calculate column dimensions within the UI width
     padding = 20
-    column_width = (w - padding * (track_count + 1)) // track_count
+    column_width = (ui_width - padding * (track_count + 1)) // track_count
 
-    # Draw title at the top
-    title_text = "Track Volume Control - Pointer Mode Active"
+    # Draw title at the top (centered within UI area)
+    title_text = "Track Volume Control"
     title_size = cv.getTextSize(title_text, cv.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
-    title_x = (w - title_size[0]) // 2
+    title_x = ui_start_x + (ui_width - title_size[0]) // 2
     cv.putText(overlay, title_text, (title_x, 50),
               cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
 
-    # Draw instruction
+    # Draw instruction (centered within UI area)
     instruction_text = "Point at a track to adjust its volume"
     instruction_size = cv.getTextSize(instruction_text, cv.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
-    instruction_x = (w - instruction_size[0]) // 2
+    instruction_x = ui_start_x + (ui_width - instruction_size[0]) // 2
     cv.putText(overlay, instruction_text, (instruction_x, 85),
               cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv.LINE_AA)
 
@@ -391,8 +403,8 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
         if track_info is None:
             continue
 
-        # Calculate column position (use col_idx for positioning, not track_idx)
-        column_x = padding + col_idx * (column_width + padding)
+        # Calculate column position within UI area (use col_idx for positioning, not track_idx)
+        column_x = ui_start_x + padding + col_idx * (column_width + padding)
 
         # Determine column color based on hover state
         if hovered_track_idx == track_idx:
@@ -529,7 +541,7 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
 
     return image
 
-def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
+def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape, primary_hand):
     """
     Determine which track column is being hovered in the overlay.
     
@@ -537,6 +549,7 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
         player: The DynamicMidiPlayer instance
         secondary_hand_pos: Tuple (x, y) of secondary hand position in pixels
         image_shape: Tuple (height, width, channels) of the image
+        primary_hand: Handedness enum indicating which hand is primary
     
     Returns:
         Track index being hovered, or None if not hovering over any column
@@ -547,6 +560,21 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
     h, w = image_shape[:2]
     hand_x, hand_y = secondary_hand_pos
 
+    # Calculate UI bounds (60% of screen opposite to primary hand)
+    ui_width = int(w * 0.6)
+    if primary_hand == Handedness.RIGHT:
+        # Primary hand is right, so UI spans left 60%
+        ui_start_x = 0
+        ui_end_x = ui_width
+    else:
+        # Primary hand is left, so UI spans right 60%
+        ui_start_x = w - ui_width
+        ui_end_x = w
+
+    # Check if hand is in the UI area horizontally
+    if hand_x < ui_start_x or hand_x > ui_end_x:
+        return None
+
     # Check if hand is in the track column area
     column_start_y = 120
     column_height = h - column_start_y - 50
@@ -554,14 +582,14 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
     if hand_y < column_start_y or hand_y > column_start_y + column_height:
         return None
 
-    # Calculate column dimensions
+    # Calculate column dimensions within the UI width
     tracks_w_notes, track_count = player.get_tracks_with_notes()
     padding = 20
-    column_width = (w - padding * (track_count + 1)) // track_count
+    column_width = (ui_width - padding * (track_count + 1)) // track_count
 
     # Check each track column
     for col_idx, track_idx in enumerate(tracks_w_notes):
-        column_x = padding + col_idx * (column_width + padding)
+        column_x = ui_start_x + padding + col_idx * (column_width + padding)
         if column_x <= hand_x <= column_x + column_width:
             return track_idx
 
@@ -1017,7 +1045,7 @@ def main():
                 if player is not None:
                     if is_pointer_mode:
                         # Pointer mode: Adjust individual track volume based on hover
-                        hovered_track_idx = get_hovered_track_in_overlay(player, secondary_hand_pixel_pos, frame.shape)
+                        hovered_track_idx = get_hovered_track_in_overlay(player, secondary_hand_pixel_pos, frame.shape, hand_tracker.primary_hand)
 
                         current_y_position = secondary_conducting_frame.position[1]
 
@@ -1110,7 +1138,7 @@ def main():
             
             # Draw track selection overlay if in pointer mode
             if secondary_conducting_frame and is_pointer_mode:
-                display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, hovered_track_idx)
+                display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, hovered_track_idx, hand_tracker.primary_hand)
             
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
