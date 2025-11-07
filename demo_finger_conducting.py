@@ -358,7 +358,7 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
 
     # Create a translucent overlay
     overlay = image.copy()
-    alpha = 0.7  # Transparency level (0.0 = fully transparent, 1.0 = opaque)
+    alpha = 0.4  # Transparency level (0.0 = fully transparent, 1.0 = opaque)
 
     # Draw semi-transparent background covering the whole screen
     cv.rectangle(overlay, (0, 0), (w, h), (40, 40, 40), -1)
@@ -415,7 +415,7 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
                     border_color, border_thickness)
 
         # Draw track name (wrapped if too long)
-        track_name = track_info['name']
+        track_name = track_info['label']
         max_chars_per_line = max(1, column_width // 10)  # Rough estimate
 
         # Split long names into multiple lines

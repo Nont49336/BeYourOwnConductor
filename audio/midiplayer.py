@@ -7,6 +7,59 @@ import os
 import platform
 
 
+# General MIDI instrument names (Program numbers 0-127)
+GM_INSTRUMENTS = [
+    # Piano (0-7)
+    "Acoustic Grand Piano", "Bright Acoustic Piano", "Electric Grand Piano", "Honky-tonk Piano",
+    "Electric Piano 1", "Electric Piano 2", "Harpsichord", "Clavinet",
+    # Chromatic Percussion (8-15)
+    "Celesta", "Glockenspiel", "Music Box", "Vibraphone",
+    "Marimba", "Xylophone", "Tubular Bells", "Dulcimer",
+    # Organ (16-23)
+    "Drawbar Organ", "Percussive Organ", "Rock Organ", "Church Organ",
+    "Reed Organ", "Accordion", "Harmonica", "Tango Accordion",
+    # Guitar (24-31)
+    "Acoustic Guitar (nylon)", "Acoustic Guitar (steel)", "Electric Guitar (jazz)", "Electric Guitar (clean)",
+    "Electric Guitar (muted)", "Overdriven Guitar", "Distortion Guitar", "Guitar Harmonics",
+    # Bass (32-39)
+    "Acoustic Bass", "Electric Bass (finger)", "Electric Bass (pick)", "Fretless Bass",
+    "Slap Bass 1", "Slap Bass 2", "Synth Bass 1", "Synth Bass 2",
+    # Strings (40-47)
+    "Violin", "Viola", "Cello", "Contrabass",
+    "Tremolo Strings", "Pizzicato Strings", "Orchestral Harp", "Timpani",
+    # Ensemble (48-55)
+    "String Ensemble 1", "String Ensemble 2", "Synth Strings 1", "Synth Strings 2",
+    "Choir Aahs", "Voice Oohs", "Synth Choir", "Orchestra Hit",
+    # Brass (56-63)
+    "Trumpet", "Trombone", "Tuba", "Muted Trumpet",
+    "French Horn", "Brass Section", "Synth Brass 1", "Synth Brass 2",
+    # Reed (64-71)
+    "Soprano Sax", "Alto Sax", "Tenor Sax", "Baritone Sax",
+    "Oboe", "English Horn", "Bassoon", "Clarinet",
+    # Pipe (72-79)
+    "Piccolo", "Flute", "Recorder", "Pan Flute",
+    "Blown bottle", "Shakuhachi", "Whistle", "Ocarina",
+    # Synth Lead (80-87)
+    "Lead 1 (square)", "Lead 2 (sawtooth)", "Lead 3 (calliope)", "Lead 4 (chiff)",
+    "Lead 5 (charang)", "Lead 6 (voice)", "Lead 7 (fifths)", "Lead 8 (bass + lead)",
+    # Synth Pad (88-95)
+    "Pad 1 (new age)", "Pad 2 (warm)", "Pad 3 (polysynth)", "Pad 4 (choir)",
+    "Pad 5 (bowed)", "Pad 6 (metallic)", "Pad 7 (halo)", "Pad 8 (sweep)",
+    # Synth Effects (96-103)
+    "FX 1 (rain)", "FX 2 (soundtrack)", "FX 3 (crystal)", "FX 4 (atmosphere)",
+    "FX 5 (brightness)", "FX 6 (goblins)", "FX 7 (echoes)", "FX 8 (sci-fi)",
+    # Ethnic (104-111)
+    "Sitar", "Banjo", "Shamisen", "Koto",
+    "Kalimba", "Bag pipe", "Fiddle", "Shanai",
+    # Percussive (112-119)
+    "Tinkle Bell", "Agogo", "Steel Drums", "Woodblock",
+    "Taiko Drum", "Melodic Tom", "Synth Drum", "Reverse Cymbal",
+    # Sound Effects (120-127)
+    "Guitar Fret Noise", "Breath Noise", "Seashore", "Bird Tweet",
+    "Telephone Ring", "Helicopter", "Applause", "Gunshot"
+]
+
+
 class DynamicMidiPlayer:
     """
     A MIDI player with dynamic BPM control using FluidSynth.
@@ -71,7 +124,7 @@ class DynamicMidiPlayer:
         print(f"[MIDI] ✓ FluidSynth initialized with soundfont: {os.path.basename(soundfont_path)}")
 
     def _organize_tracks(self):
-        """Organize MIDI tracks and extract track information."""
+        """Organize MIDI tracks and extract track information including instruments."""
         if not self.midi:
             return
 
@@ -79,30 +132,87 @@ class DynamicMidiPlayer:
         self.tracks = []
         self.track_volumes = []
         
-        # Process each track separately
+        # First pass: collect track information
+        track_data = []
         for track_idx, track in enumerate(self.midi.tracks):
             track_name = track.name if hasattr(track, 'name') and track.name else f"Track {track_idx}"
             
             # Determine the channel used by this track (default to track_idx % 16)
             track_channel = None
+            track_program = None  # MIDI program number (instrument)
+            
             for msg in track:
-                if hasattr(msg, 'channel'):
+                if hasattr(msg, 'channel') and track_channel is None:
                     track_channel = msg.channel
+                
+                # Extract program change (instrument) information
+                if msg.type == 'program_change':
+                    track_program = msg.program
+                    
+                # Stop searching once we have both channel and program
+                if track_channel is not None and track_program is not None:
                     break
+            
             if track_channel is None:
                 track_channel = track_idx % 16
             
-            # Store track information
-            self.tracks.append({
+            # Get instrument name from program number
+            instrument_name = None
+            if track_program is not None and 0 <= track_program < len(GM_INSTRUMENTS):
+                instrument_name = GM_INSTRUMENTS[track_program]
+            
+            track_data.append({
                 'name': track_name,
                 'channel': track_channel,
+                'program': track_program,
+                'instrument': instrument_name,
                 'original_index': track_idx
+            })
+        
+        # Second pass: count instrument occurrences and assign numbers to duplicates
+        instrument_counts = {}
+        instrument_indices = {}
+        
+        for data in track_data:
+            instrument_name = data['instrument']
+            if instrument_name:
+                if instrument_name not in instrument_counts:
+                    instrument_counts[instrument_name] = 0
+                    instrument_indices[instrument_name] = []
+                instrument_counts[instrument_name] += 1
+                instrument_indices[instrument_name].append(len(self.tracks))
+        
+        # Third pass: create labels with unique numbering
+        for data in track_data:
+            instrument_name = data['instrument']
+            
+            # Create a descriptive label for the track
+            if instrument_name:
+                # If there are multiple tracks with the same instrument, add a number
+                if instrument_counts[instrument_name] > 1:
+                    # Find which occurrence this is (1-indexed)
+                    occurrence = instrument_indices[instrument_name].index(len(self.tracks)) + 1
+                    track_label = f"{instrument_name} {occurrence}"
+                else:
+                    track_label = instrument_name
+            else:
+                track_label = data['name']
+            
+            # Store track information
+            self.tracks.append({
+                'name': data['name'],
+                'label': track_label,
+                'channel': data['channel'],
+                'program': data['program'],
+                'instrument': data['instrument'],
+                'original_index': data['original_index']
             })
             self.track_volumes.append(1.0)
         
         print(f"[MIDI] Organized {len(self.tracks)} tracks")
         for i, track in enumerate(self.tracks):
-            print(f"  Track {i}: {track['name']} (Channel {track['channel']})")
+            instrument_info = f" - {track['instrument']}" if track['instrument'] else ""
+            print(f"  Track {i}: {track['label']} (Ch.{track['channel']}){instrument_info}")
 
     def chop_midi_into_beats(self):
         current_tempo = self.original_tempo #might be good to use adaptive tempo to adjsut the 
@@ -474,7 +584,10 @@ class DynamicMidiPlayer:
         Returns:
             Dictionary with track information:
             - name: Track name
+            - label: Track label (name + instrument if available)
             - channel: MIDI channel used by the track
+            - program: MIDI program number (0-127, or None if not set)
+            - instrument: Instrument name (or None if not identified)
             - volume: Track volume multiplier (0.0 to 2.0)
             
             Returns None if track index is invalid.
@@ -482,7 +595,10 @@ class DynamicMidiPlayer:
         if 0 <= track_idx < len(self.tracks):
             return {
                 'name': self.tracks[track_idx]['name'],
+                'label': self.tracks[track_idx]['label'],
                 'channel': self.tracks[track_idx]['channel'],
+                'program': self.tracks[track_idx]['program'],
+                'instrument': self.tracks[track_idx]['instrument'],
                 'volume': self.track_volumes[track_idx]
             }
         return None
@@ -497,7 +613,7 @@ class DynamicMidiPlayer:
         """
         if 0 <= track_idx < len(self.tracks):
             self.track_volumes[track_idx] = max(0.0, min(2.0, volume))
-            print(f"[MIDI] Track {track_idx} ({self.tracks[track_idx]['name']}) volume set to {volume:.2f}")
+            print(f"[MIDI] Track {track_idx} ({self.tracks[track_idx]['label']}) volume set to {volume:.2f}")
         else:
             print(f"[Error] Invalid track index: {track_idx}")
     
@@ -538,7 +654,8 @@ class DynamicMidiPlayer:
         print(f"\n[MIDI] Tracks in {os.path.basename(self.midi_path)}:")
         for i in range(len(self.tracks)):
             info = self.get_track_info(i)
-            print(f"  {i}: {info['name']} (Ch.{info['channel']}, Vol:{info['volume']:.1f})")
+            instrument_str = f" - {info['instrument']}" if info['instrument'] else ""
+            print(f"  {i}: {info['name']} (Ch.{info['channel']}, Vol:{info['volume']:.1f}){instrument_str}")
     
     def close(self):
         """Close FluidSynth and clean up resources."""
