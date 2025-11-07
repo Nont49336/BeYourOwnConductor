@@ -157,8 +157,11 @@ class DynamicMidiPlayer:
                 track_channel = track_idx % 16
             
             # Get instrument name from program number
+            # Special case: Channel 10 (index 9) is always drums in General MIDI
             instrument_name = None
-            if track_program is not None and 0 <= track_program < len(GM_INSTRUMENTS):
+            if track_channel == 9:  # Channel 10 in 1-indexed (9 in 0-indexed)
+                instrument_name = "Drum Kit"
+            elif track_program is not None and 0 <= track_program < len(GM_INSTRUMENTS):
                 instrument_name = GM_INSTRUMENTS[track_program]
             
             track_data.append({
