@@ -435,8 +435,18 @@ class DynamicMidiPlayer:
                     
                         # time.sleep(msg.time*time_scale)
                         time.sleep(msg.time)
+
+                        # Determine which track this message belongs to (if it has a channel)
+                        track_idx = -1
+                        if hasattr(msg, 'channel'):
+                            track_idx = self._get_track_for_channel(msg.channel)
+
+                        # Get track volume multiplier
+                        track_volume = self._get_track_volume(track_idx)
+
                         if msg.type == 'note_on':
-                            adjusted_velocity = min(int(msg.velocity * self.volume), 127)
+                            combined_volume = self.volume * track_volume
+                            adjusted_velocity = min(127, int(msg.velocity * combined_volume))
                             self.fs.noteon(msg.channel, msg.note, adjusted_velocity)
                         elif msg.type == 'note_off':
                             self.fs.noteoff(msg.channel, msg.note)

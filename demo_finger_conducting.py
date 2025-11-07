@@ -10,6 +10,7 @@ import argparse
 import copy
 import cv2 as cv
 import os
+import time
 
 from vision_modules.hand_tracking import Handedness, HandTracking
 from vision_modules.conducting_protocol import (
@@ -200,7 +201,6 @@ def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_
     info_y += line_height
     
     # Beat event display - show for 0.3 seconds after beat
-    import time
     if beat_display_time > 0 and (time.time() - beat_display_time) < 0.3:
         event_text = f"BEAT!"
         cv.putText(image, event_text, (w // 2 - 80, 100),
@@ -333,7 +333,8 @@ def draw_pattern_guide(image, conducting_analyzer):
     
     return image
 
-def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered_track_idx=None):
+def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered_track_idx=None, 
+                                selected_track_idx=None, hover_start_time=None, primary_hand=Handedness.RIGHT):
     """
     Draw a translucent overlay showing all tracks for volume control.
     Appears when secondary hand is in "Pointer" mode.
@@ -342,11 +343,57 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
         image: The image to draw on
         player: The DynamicMidiPlayer instance
         secondary_hand_pos: Tuple (x, y) of secondary hand position in pixels, or None
-        hovered_track_idx: Index of the track currently being hovered
+        hovered_track_idx: Index of the track currently being hovered (or "global")
+        selected_track_idx: Index of the currently selected track (or "global")
+        hover_start_time: Time when hovering started on current track
+        primary_hand: Handedness enum indicating which hand is primary (default: RIGHT)
     
     Returns:
         Updated image
     """
+    def get_column_colors(is_selected, is_hovered):
+        """Helper to get column colors based on state."""
+        if is_selected:
+            return (50, 200, 50), (100, 255, 100), 4  # Green when selected
+        elif is_hovered:
+            return (100, 150, 255), (150, 200, 255), 3  # Bright blue when hovered
+        else:
+            return (70, 70, 70), (120, 120, 120), 2  # Dark gray
+    
+    def draw_column_box(overlay, column_x, column_start_y, column_width, column_height, 
+                        column_color, border_color, border_thickness):
+        """Helper to draw column background and border."""
+        cv.rectangle(overlay, (column_x, column_start_y),
+                    (column_x + column_width, column_start_y + column_height),
+                    column_color, -1)
+        cv.rectangle(overlay, (column_x, column_start_y),
+                    (column_x + column_width, column_start_y + column_height),
+                    border_color, border_thickness)
+    
+    def draw_centered_text(overlay, text, column_x, y_pos, column_width, 
+                          font_scale, color, thickness):
+        """Helper to draw centered text in a column."""
+        text_size = cv.getTextSize(text, cv.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+        text_x = column_x + (column_width - text_size[0]) // 2
+        cv.putText(overlay, text, (text_x, y_pos),
+                  cv.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness, cv.LINE_AA)
+    
+    def draw_hover_progress_bar(overlay, column_x, column_start_y, column_width, 
+                                column_height, hover_start_time):
+        """Helper to draw hover progress bar."""
+        if hover_start_time is not None:
+            hover_duration = time.time() - hover_start_time
+            progress = min(1.0, hover_duration / 1.0)  # 1 seconds to select
+            
+            progress_bar_width = int((column_width - 10) * progress)
+            progress_y = column_start_y + column_height - 15
+            cv.rectangle(overlay, (column_x + 5, progress_y),
+                        (column_x + 5 + progress_bar_width, progress_y + 10),
+                        (0, 255, 255), -1)
+            cv.rectangle(overlay, (column_x + 5, progress_y),
+                        (column_x + column_width - 5, progress_y + 10),
+                        (255, 255, 255), 1)
+    
     if player is None:
         return image
 
@@ -356,34 +403,49 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
     if track_count == 0:
         return image
 
+    # Calculate UI bounds (60% of screen opposite to primary hand)
+    ui_width = int(w * 0.6)
+    ui_start_x = 0 if primary_hand == Handedness.RIGHT else w - ui_width
+
     # Create a translucent overlay
     overlay = image.copy()
-    alpha = 0.4  # Transparency level (0.0 = fully transparent, 1.0 = opaque)
+    alpha = 0.4  # Transparency level
 
     # Draw semi-transparent background covering the whole screen
     cv.rectangle(overlay, (0, 0), (w, h), (40, 40, 40), -1)
 
-    # Calculate column dimensions
+    # Calculate column dimensions within the UI width (+1 for global)
     padding = 20
-    column_width = (w - padding * (track_count + 1)) // track_count
+    column_width = (ui_width - padding * (track_count + 2)) // (track_count + 1)
 
-    # Draw title at the top
-    title_text = "Track Volume Control - Pointer Mode Active"
-    title_size = cv.getTextSize(title_text, cv.FONT_HERSHEY_SIMPLEX, 1.0, 2)[0]
-    title_x = (w - title_size[0]) // 2
-    cv.putText(overlay, title_text, (title_x, 50),
-              cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2, cv.LINE_AA)
-
-    # Draw instruction
-    instruction_text = "Point at a track to adjust its volume"
-    instruction_size = cv.getTextSize(instruction_text, cv.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
-    instruction_x = (w - instruction_size[0]) // 2
-    cv.putText(overlay, instruction_text, (instruction_x, 85),
-              cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv.LINE_AA)
+    # Draw title and instruction
+    draw_centered_text(overlay, "Track Selection", ui_start_x, 50, ui_width, 1.0, (255, 255, 255), 2)
+    draw_centered_text(overlay, "Point at a track for 2 seconds to select", ui_start_x, 85, 
+                      ui_width, 0.6, (200, 200, 200), 1)
 
     # Start position for track columns
     column_start_y = 120
     column_height = h - column_start_y - 50
+
+    # Draw Global Volume column
+    column_x = ui_start_x + padding
+    is_global_hovered = (hovered_track_idx == "global")
+    is_global_selected = (selected_track_idx == "global")
+    
+    column_color, border_color, border_thickness = get_column_colors(is_global_selected, is_global_hovered)
+    draw_column_box(overlay, column_x, column_start_y, column_width, column_height,
+                   column_color, border_color, border_thickness)
+    
+    draw_centered_text(overlay, "GLOBAL", column_x, column_start_y + 40, column_width, 0.6, (255, 255, 255), 2)
+    draw_centered_text(overlay, "All Tracks", column_x, column_start_y + 65, column_width, 0.4, (200, 200, 200), 1)
+    
+    global_volume = player.get_volume()
+    draw_centered_text(overlay, f"{int(global_volume * 100)}%", column_x, column_start_y + 100,
+                      column_width, 0.7, (255, 255, 255), 2)
+    
+    if is_global_hovered:
+        draw_hover_progress_bar(overlay, column_x, column_start_y, column_width, 
+                               column_height, hover_start_time)
 
     # Draw each track column
     for col_idx, track_idx in enumerate(tracks_w_notes):
@@ -391,32 +453,20 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
         if track_info is None:
             continue
 
-        # Calculate column position (use col_idx for positioning, not track_idx)
-        column_x = padding + col_idx * (column_width + padding)
+        # Calculate column position (offset by 1 for global column)
+        column_x = ui_start_x + padding + (col_idx + 1) * (column_width + padding)
 
-        # Determine column color based on hover state
-        if hovered_track_idx == track_idx:
-            column_color = (100, 150, 255)  # Bright blue when hovered
-            border_color = (150, 200, 255)
-            border_thickness = 3
-        else:
-            column_color = (70, 70, 70)  # Dark gray
-            border_color = (120, 120, 120)
-            border_thickness = 2
-
-        # Draw column background
-        cv.rectangle(overlay, 
-                    (column_x, column_start_y),
-                    (column_x + column_width, column_start_y + column_height),
-                    column_color, -1)
-        cv.rectangle(overlay,
-                    (column_x, column_start_y),
-                    (column_x + column_width, column_start_y + column_height),
-                    border_color, border_thickness)
+        # Determine column state and colors
+        is_track_selected = (selected_track_idx == track_idx)
+        is_track_hovered = (hovered_track_idx == track_idx)
+        
+        column_color, border_color, border_thickness = get_column_colors(is_track_selected, is_track_hovered)
+        draw_column_box(overlay, column_x, column_start_y, column_width, column_height,
+                       column_color, border_color, border_thickness)
 
         # Draw track name (wrapped if too long)
         track_name = track_info['label']
-        max_chars_per_line = max(1, column_width // 10)  # Rough estimate
+        max_chars_per_line = max(1, column_width // 10)
 
         # Split long names into multiple lines
         name_lines = []
@@ -435,89 +485,21 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
         else:
             name_lines = [track_name]
 
-        # Limit to 3 lines maximum
-        name_lines = name_lines[:3]
-
-        # Draw track name (centered)
+        # Limit to 3 lines maximum and draw
         text_y = column_start_y + 40
-        for line in name_lines:
-            text_size = cv.getTextSize(line, cv.FONT_HERSHEY_SIMPLEX, 0.5, 1)[0]
-            text_x = column_x + (column_width - text_size[0]) // 2
-            cv.putText(overlay, line, (text_x, text_y),
-                      cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+        for line in name_lines[:3]:
+            draw_centered_text(overlay, line, column_x, text_y, column_width, 0.5, (255, 255, 255), 1)
             text_y += 25
+        
+        # Draw track volume percentage
+        track_volume = player._get_track_volume(track_idx)
+        draw_centered_text(overlay, f"{int(track_volume * 100)}%", column_x, column_start_y + 100,
+                          column_width, 0.7, (255, 255, 255), 2)
 
-        # Draw volume bar (vertical) - Range: 50% to 150%
-        bar_width = 50
-        bar_height = column_height - 150
-        bar_x = column_x + (column_width - bar_width) // 2
-        bar_y = column_start_y + 120
-
-        # Draw bar background
-        cv.rectangle(overlay,
-                    (bar_x, bar_y),
-                    (bar_x + bar_width, bar_y + bar_height),
-                    (30, 30, 30), -1)
-        cv.rectangle(overlay,
-                    (bar_x, bar_y),
-                    (bar_x + bar_width, bar_y + bar_height),
-                    (150, 150, 150), 2)
-
-        # Draw reference lines
-        # 100% line (middle)
-        mid_y = bar_y + bar_height // 2
-        cv.line(overlay, (bar_x, mid_y), (bar_x + bar_width, mid_y),
-                (100, 100, 100), 1)
-
-        # Draw volume level mapped to 50%-150% range
-        track_volume = track_info['volume']
-        # Map volume from [0.5, 1.5] to [0, 1] for bar display
-        normalized_volume = (track_volume - 0.5) / (1.5 - 0.5)
-        normalized_volume = max(0.0, min(1.0, normalized_volume))
-        filled_height = int(bar_height * normalized_volume)
-
-        # Choose color based on volume level
-        if track_volume > 1.0:
-            bar_color = (0, 200, 255)  # Orange for above 100%
-        elif track_volume == 1.0:
-            bar_color = (0, 255, 0)  # Green for 100%
-        else:
-            bar_color = (100, 200, 100)  # Light green for below 100%
-
-        if filled_height > 0:
-            cv.rectangle(overlay,
-                        (bar_x + 2, bar_y + bar_height - filled_height),
-                        (bar_x + bar_width - 2, bar_y + bar_height - 2),
-                        bar_color, -1)
-
-        # Draw volume percentage
-        vol_text = f"{int(track_volume * 100)}%"
-        vol_text_size = cv.getTextSize(vol_text, cv.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
-        vol_text_x = column_x + (column_width - vol_text_size[0]) // 2
-        vol_text_y = bar_y + bar_height + 35
-
-        # Draw text with shadow for better visibility
-        cv.putText(overlay, vol_text, (vol_text_x + 2, vol_text_y + 2),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(overlay, vol_text, (vol_text_x, vol_text_y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv.LINE_AA)
-
-        # Draw min/max labels
-        min_label = "50%"
-        max_label = "150%"
-        label_size = 0.35
-
-        # Min label (bottom)
-        cv.putText(overlay, min_label, (bar_x - 5, bar_y + bar_height + 15),
-                  cv.FONT_HERSHEY_SIMPLEX, label_size, (150, 150, 150), 1, cv.LINE_AA)
-
-        # Max label (top)
-        cv.putText(overlay, max_label, (bar_x - 5, bar_y - 5),
-                  cv.FONT_HERSHEY_SIMPLEX, label_size, (150, 150, 150), 1, cv.LINE_AA)
-
-        # 100% label (middle reference line)
-        cv.putText(overlay, "100%", (bar_x + bar_width + 5, mid_y + 4),
-                  cv.FONT_HERSHEY_SIMPLEX, label_size, (150, 150, 150), 1, cv.LINE_AA)
+        # Draw hover progress bar if hovering on this track
+        if is_track_hovered:
+            draw_hover_progress_bar(overlay, column_x, column_start_y, column_width,
+                                   column_height, hover_start_time)
 
     # Draw secondary hand indicator if present
     if secondary_hand_pos is not None:
@@ -529,7 +511,7 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
 
     return image
 
-def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
+def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape, primary_hand):
     """
     Determine which track column is being hovered in the overlay.
     
@@ -537,9 +519,10 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
         player: The DynamicMidiPlayer instance
         secondary_hand_pos: Tuple (x, y) of secondary hand position in pixels
         image_shape: Tuple (height, width, channels) of the image
+        primary_hand: Handedness enum indicating which hand is primary
     
     Returns:
-        Track index being hovered, or None if not hovering over any column
+        Track index being hovered, "global" for global volume, or None if not hovering
     """
     if player is None or secondary_hand_pos is None:
         return None
@@ -554,18 +537,97 @@ def get_hovered_track_in_overlay(player, secondary_hand_pos, image_shape):
     if hand_y < column_start_y or hand_y > column_start_y + column_height:
         return None
 
-    # Calculate column dimensions
+    # Calculate UI bounds (60% of screen opposite to primary hand)
+    ui_width = int(w * 0.6)
+    ui_start_x = 0 if primary_hand == Handedness.RIGHT else w - ui_width
+
+    # Calculate column dimensions within the UI width (+1 for global)
     tracks_w_notes, track_count = player.get_tracks_with_notes()
     padding = 20
-    column_width = (w - padding * (track_count + 1)) // track_count
+    column_width = (ui_width - padding * (track_count + 2)) // (track_count + 1)
+
+    # Check global column first
+    column_x = ui_start_x + padding
+    if column_x <= hand_x <= column_x + column_width:
+        return "global"
 
     # Check each track column
     for col_idx, track_idx in enumerate(tracks_w_notes):
-        column_x = padding + col_idx * (column_width + padding)
+        column_x = ui_start_x + padding + (col_idx + 1) * (column_width + padding)
         if column_x <= hand_x <= column_x + column_width:
             return track_idx
 
     return None
+
+def draw_selected_track_indicator(image, player, selected_track_idx):
+    """
+    Draw the currently selected track in the lower left corner.
+    Shown when NOT in pointer mode.
+    
+    Args:
+        image: The image to draw on
+        player: The DynamicMidiPlayer instance
+        selected_track_idx: Index of selected track, "global", or None
+    
+    Returns:
+        Updated image
+    """
+    if selected_track_idx is None:
+        return image
+    
+    h, w = image.shape[:2]
+    
+    # Box dimensions and position
+    padding = 10
+    box_width = 250
+    box_height = 120
+    box_x = padding
+    box_y = h - box_height - padding
+    
+    # Create semi-transparent background
+    overlay = image.copy()
+    cv.rectangle(overlay, (box_x, box_y), (box_x + box_width, box_y + box_height),
+                (40, 40, 40), -1)
+    cv.addWeighted(overlay, 0.7, image, 0.3, 0, image)
+    
+    # Draw border
+    cv.rectangle(image, (box_x, box_y), (box_x + box_width, box_y + box_height),
+                (100, 255, 100), 2)
+    
+    # Draw title
+    cv.putText(image, "Selected:", (box_x + 10, box_y + 25),
+              cv.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1, cv.LINE_AA)
+    
+    # Get track information and volume based on selection type
+    if selected_track_idx == "global":
+        track_name = "GLOBAL"
+        subtitle = "All Tracks"
+        vol_percent = int(player.get_volume() * 100)
+    else:
+        track_info = player.get_track_info(selected_track_idx)
+        vol_percent = int(player._get_track_volume(selected_track_idx) * 100)
+        track_name = track_info['label'] if track_info else f"Track {selected_track_idx}"
+        subtitle = f"Track {selected_track_idx}" if track_info else ""
+    
+    # Wrap track name if too long
+    max_chars = 15
+    if len(track_name) > max_chars:
+        track_name = track_name[:max_chars-3] + "..."
+    
+    # Draw track name
+    cv.putText(image, track_name, (box_x + 10, box_y + 55),
+              cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv.LINE_AA)
+    
+    # Draw subtitle if available
+    if subtitle:
+        cv.putText(image, subtitle, (box_x + 10, box_y + 80),
+                  cv.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1, cv.LINE_AA)
+    
+    # Draw current volume level
+    cv.putText(image, f"Volume: {vol_percent}%", (box_x + 10, box_y + 105),
+                cv.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv.LINE_AA)
+    
+    return image
 
 def draw_countdown_overlay(image, countdown_beats_detected, countdown_required, calibrated_bpm=None):
     """Draw countdown overlay showing beat calibration progress."""
@@ -793,7 +855,6 @@ def main():
     )
     
     # Beat display tracking
-    import time
     last_beat_time = 0.0
     
     # Beat history tracking for visualization (tracks which positions were beats)
@@ -801,9 +862,10 @@ def main():
     primary_beat_history = deque(maxlen=40)  # Match history_length from analyzer
     secondary_beat_history = deque(maxlen=40)
 
-    # Track volume control state
-    last_hovered_track = None
-    last_pointer_y_position = None  # Track last Y position for delta calculation
+    # Track selection state
+    selected_track_idx = "global"  # Default to global volume
+    hovered_track_idx = None
+    hover_start_time = None
     
     # Get and display pattern information
     pattern_info = conducting_analyzer.get_pattern_info()
@@ -829,8 +891,8 @@ def main():
     print(f"Press SPACE to start countdown ({countdown_required} beats to calibrate tempo)")
     print("\nConducting:")
     print("  Primary Hand   - Controls tempo and beats")
-    print("  Secondary Hand - Normal: Adjust global volume (all tracks)")
-    print("                   Pointer Gesture: Show track overlay + adjust individual tracks")
+    print("  Secondary Hand - Normal: Adjust volume of selected track/global")
+    print("                   Pointer Gesture: Select tracks (hover 2s to select)")
     print("                   Move hand UP/DOWN to increase/decrease volume")
     print("-" * 70)
 
@@ -1012,67 +1074,47 @@ def main():
             # Adjust volume
             # Based on secondary hand's vertical position
             # Track sound effects (only from secondary hand)
-            hovered_track_idx = None
             if secondary_conducting_frame and player is not None:
-                if player is not None:
-                    if is_pointer_mode:
-                        # Pointer mode: Adjust individual track volume based on hover
-                        hovered_track_idx = get_hovered_track_in_overlay(player, secondary_hand_pixel_pos, frame.shape)
-
-                        current_y_position = secondary_conducting_frame.position[1]
-
-                        if hovered_track_idx is not None:
-                            # Check if we just entered a new track
-                            if last_hovered_track != hovered_track_idx:
-                                # Just entered this track: Record initial position and current volume
-                                # DO NOT change the volume yet!
-                                track_info = player.get_track_info(hovered_track_idx)
-                                last_pointer_y_position = current_y_position
-                                last_hovered_track = hovered_track_idx
-                                # Store the initial volume when we entered (will be used as baseline)
-                                # Note: We're not changing volume here, just recording the state
-                            else:
-                                # Still in same track: Apply relative changes from entry point
-                                if last_pointer_y_position is not None:
-                                    # Calculate change in Y position from when we entered
-                                    delta_y = last_pointer_y_position - current_y_position
-
-                                    # Only apply if there's significant movement
-                                    if abs(delta_y) > 0.005:  # Threshold to avoid jitter
-                                        # Get current track volume
-                                        track_info = player.get_track_info(hovered_track_idx)
-                                        current_volume = track_info['volume']
-
-                                        # Apply delta change (delta_y is inverted because lower y = higher in image coords)
-                                        # Positive delta_y means pointer moved up (decrease y) → increase volume
-                                        # Scale delta to reasonable volume change
-                                        volume_change = delta_y * 2.0
-                                        new_volume = current_volume + volume_change
-
-                                        # Clamp to valid range [0.5, 1.5]
-                                        new_volume = max(0.5, min(1.5, new_volume))
-
-                                        # Apply new volume
-                                        player.set_track_volume(hovered_track_idx, new_volume)
-
-                                        # Update the recorded position to current position
-                                        # This makes the next delta relative to this new position
-                                        last_pointer_y_position = current_y_position
+                if is_pointer_mode:
+                    # Pointer mode: Select track by hovering for 2 seconds
+                    current_hovered = get_hovered_track_in_overlay(player, secondary_hand_pixel_pos, frame.shape, hand_tracker.primary_hand)
+                    
+                    if current_hovered != hovered_track_idx:
+                        # Started hovering on a new track/option
+                        hovered_track_idx = current_hovered
+                        if current_hovered is not None:
+                            hover_start_time = time.time()
                         else:
-                            # Not hovering over any track - clear the record
-                            last_hovered_track = None
-                            last_pointer_y_position = None
-                    else:
-                        # Normal mode: Adjust all tracks (global volume)
-                        # Reset pointer mode tracking when exiting pointer mode
-                        last_hovered_track = None
-                        last_pointer_y_position = None
-
-                        if secondary_conducting_frame.direction != Direction.NEUTRAL:
-                            # Calculate volume level from hand position
-                            tracked_vol_position = 1.0 - secondary_conducting_frame.position[1]
-                            vol_level = tracked_vol_position * (1.5 - 0.5) + 0.5  # Scale to 0.5 - 1.5
-                            player.set_volume(vol_level)
+                            hover_start_time = None
+                    elif current_hovered is not None and hover_start_time is not None:
+                        # Still hovering on the same track - check if 1 seconds elapsed
+                        hover_duration = time.time() - hover_start_time
+                        if hover_duration >= 1.0:
+                            # Selection confirmed!
+                            selected_track_idx = current_hovered
+                            hover_start_time = None
+                else:
+                    # Normal mode: Adjust volume of selected track/global using Y position
+                    # Reset hover tracking when not in pointer mode
+                    hovered_track_idx = None
+                    hover_start_time = None
+                    
+                    if secondary_conducting_frame.direction != Direction.NEUTRAL:
+                        current_y_position = secondary_conducting_frame.position[1]
+                        
+                        # Map Y position directly to volume (0.0 to 1.0 normalized -> 0.5 to 1.5 volume)
+                        # Top of screen (y=0.0) = max volume (1.5), bottom (y=1.0) = min volume (0.5)
+                        volume_from_position = 1.5 - (current_y_position * 1.0)  # Maps 0.0->1.5, 1.0->0.5
+                        volume_from_position = max(0.5, min(1.5, volume_from_position))
+                        
+                        if selected_track_idx == "global":
+                            # Adjust global volume for entire MIDI file
+                            player.set_volume(volume_from_position)
+                        else:
+                            # Adjust selected track only
+                            track_info = player.get_track_info(selected_track_idx)
+                            if track_info:
+                                player.set_track_volume(selected_track_idx, volume_from_position)
 
             # Draw point history trail with beat highlight (green circles for smoothed positions, yellow for beats)
             if conducting_frame:
@@ -1110,7 +1152,13 @@ def main():
             
             # Draw track selection overlay if in pointer mode
             if secondary_conducting_frame and is_pointer_mode:
-                display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, hovered_track_idx)
+                display_image = draw_track_selection_overlay(display_image, player, secondary_hand_pixel_pos, 
+                                                             hovered_track_idx, selected_track_idx, hover_start_time,
+                                                             hand_tracker.primary_hand)
+            
+            # Draw selected track indicator when NOT in pointer mode (lower left corner)
+            if secondary_conducting_frame and not is_pointer_mode and selected_track_idx is not None:
+                display_image = draw_selected_track_indicator(display_image, player, selected_track_idx)
             
             # Display the frame
             cv.imshow('Finger Conducting', display_image)
