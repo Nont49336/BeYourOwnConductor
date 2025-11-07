@@ -23,6 +23,7 @@ from vision_modules.conducting_protocol import (
 )
 from audio.midiplayer import DynamicMidiPlayer
 
+SELECT_HOVER_TIME = 0  # seconds required to hover for selection
 
 def get_args():
     """Parse command line arguments."""
@@ -64,7 +65,7 @@ def draw_point_history(image, conducting_frame: ConductingFrame, beat_history: l
     Args:
         image: The image to draw on
         conducting_frame: The conducting frame with position history
-        beat_history: List tracking which positions in history were beats (same length as position_history)
+        beat_history: List of tuples (is_beat, timestamp) tracking beat events with timestamps
     """
     if not conducting_frame or not conducting_frame.metadata:
         return image
@@ -94,7 +95,7 @@ def draw_point_history(image, conducting_frame: ConductingFrame, beat_history: l
             # Check if this position was a beat event
             # offset by velocity smoothing to align with history
             offset_index = min(len(beat_history) - 1, index + velocity_smoothing)
-            is_beat = offset_index < len(beat_history) and beat_history[offset_index]
+            is_beat = offset_index < len(beat_history) and beat_history[offset_index][0]
             
             if is_beat:
                 # Draw bright yellow circle for beat ictus point (persists and fades)
@@ -386,18 +387,19 @@ def draw_track_selection_overlay(image, player, secondary_hand_pos=None, hovered
     def draw_hover_progress_bar(overlay, column_x, column_start_y, column_width, 
                                 column_height, hover_start_time):
         """Helper to draw hover progress bar."""
-        if hover_start_time is not None:
-            hover_duration = time.time() - hover_start_time
-            progress = min(1.0, hover_duration / 1.0)  # 1 seconds to select
-            
-            progress_bar_width = int((column_width - 10) * progress)
-            progress_y = column_start_y + column_height - 15
-            cv.rectangle(overlay, (column_x + 5, progress_y),
-                        (column_x + 5 + progress_bar_width, progress_y + 10),
-                        (0, 255, 255), -1)
-            cv.rectangle(overlay, (column_x + 5, progress_y),
-                        (column_x + column_width - 5, progress_y + 10),
-                        (255, 255, 255), 1)
+        pass
+        # if hover_start_time is not None:
+        #     hover_duration = time.time() - hover_start_time
+        #     progress = min(SELECT_HOVER_TIME, hover_duration / SELECT_HOVER_TIME)  # 0.5 seconds to select
+
+        #     progress_bar_width = int((column_width - 10) * progress)
+        #     progress_y = column_start_y + column_height - 15
+        #     cv.rectangle(overlay, (column_x + 5, progress_y),
+        #                 (column_x + 5 + progress_bar_width, progress_y + 10),
+        #                 (0, 255, 255), -1)
+        #     cv.rectangle(overlay, (column_x + 5, progress_y),
+        #                 (column_x + column_width - 5, progress_y + 10),
+        #                 (255, 255, 255), 1)
     
     if player is None:
         return image
@@ -898,9 +900,19 @@ def main():
     last_beat_time = 0.0
     
     # Beat history tracking for visualization (tracks which positions were beats)
+    # Each entry is a tuple: (is_beat: bool, timestamp: float)
     from collections import deque
-    primary_beat_history = deque(maxlen=40)  # Match history_length from analyzer
-    secondary_beat_history = deque(maxlen=40)
+    primary_beat_history = deque()  # No maxlen - we'll manually clean up old entries
+    secondary_beat_history = deque()
+    
+    # Threshold for cleaning up old beat history entries (2 seconds)
+    BEAT_HISTORY_TIMEOUT = 2.0
+    
+    def cleanup_old_beat_history(beat_history_deque, current_time):
+        """Remove beat history entries older than BEAT_HISTORY_TIMEOUT."""
+        while beat_history_deque and (current_time - beat_history_deque[0][1]) > BEAT_HISTORY_TIMEOUT:
+            beat_history_deque.popleft()
+
 
     # Track selection state
     selected_track_idx = "global"  # Default to global volume
@@ -1070,17 +1082,24 @@ def main():
                 timestamp=primary_hand_results.timestamp if primary_hand_results else None
             )
             
+            # Get current time for beat history cleanup
+            current_time = time.time()
+            
+            # Clean up old beat history entries (older than 2 seconds)
+            cleanup_old_beat_history(primary_beat_history, current_time)
+            cleanup_old_beat_history(secondary_beat_history, current_time)
+            
             # Track beat events for visualization (primary hand)
             if conducting_frame:
-                primary_beat_history.append(conducting_frame.beat_event == BeatEvent.BEAT)
+                primary_beat_history.append((conducting_frame.beat_event == BeatEvent.BEAT, current_time))
             else:
-                primary_beat_history.append(False)
+                primary_beat_history.append((False, current_time))
             
             # Track beat events for visualization (secondary hand)
             if secondary_conducting_frame:
-                secondary_beat_history.append(secondary_conducting_frame.beat_event == BeatEvent.BEAT)
+                secondary_beat_history.append((secondary_conducting_frame.beat_event == BeatEvent.BEAT, current_time))
             else:
-                secondary_beat_history.append(False)
+                secondary_beat_history.append((False, current_time))
             
             # Handle countdown for tempo calibration
             if countdown_active and conducting_frame:
@@ -1174,7 +1193,7 @@ def main():
                     elif current_hovered is not None and hover_start_time is not None:
                         # Still hovering on the same track - check if 1 seconds elapsed
                         hover_duration = time.time() - hover_start_time
-                        if hover_duration >= 1.0:
+                        if hover_duration >= SELECT_HOVER_TIME:
                             # Selection confirmed!
                             selected_track_idx = current_hovered
                             hover_start_time = None
