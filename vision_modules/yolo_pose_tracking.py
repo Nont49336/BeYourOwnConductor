@@ -135,15 +135,15 @@ class YoloPoseTracking:
     
     def process_frame(self, frame: np.ndarray) -> Tuple[Optional[YoloPoseResult], Optional[YoloPoseResult]]:
         """
-        Process a single frame and return pose information.
+        Process a single frame and return pose information for both wrists.
         
         Args:
             frame: BGR image from OpenCV (numpy array)
             
         Returns:
             tuple: (primary_result, secondary_result)
-                primary_result contains the tracked wrist position
-                secondary_result is None (reserved for future multi-person tracking)
+                primary_result contains the primary wrist position (based on use_right_hand)
+                secondary_result contains the secondary wrist position (opposite hand)
         """
         timestamp = time.time()
         
@@ -169,30 +169,51 @@ class YoloPoseTracking:
         if results[0].boxes is not None and len(results[0].boxes.conf) > 0:
             detection_conf = float(results[0].boxes.conf[0].cpu().numpy())
         
-        # Extract wrist keypoint
+        # Extract both wrist keypoints
         keypoints_np = first_person.cpu().numpy()
-        wrist_data = keypoints_np[self.wrist_keypoint_idx]  # [x, y, conf]
         
-        wrist_position = None
-        wrist_confidence = float(wrist_data[2])
+        # Primary wrist (based on use_right_hand setting)
+        primary_wrist_data = keypoints_np[self.wrist_keypoint_idx]  # [x, y, conf]
+        primary_wrist_position = None
+        primary_wrist_confidence = float(primary_wrist_data[2])
         
-        # Only use wrist if confidence is above threshold
-        if wrist_confidence > self.confidence_threshold:
-            wrist_position = (int(wrist_data[0]), int(wrist_data[1]))
+        if primary_wrist_confidence > self.confidence_threshold:
+            primary_wrist_position = (int(primary_wrist_data[0]), int(primary_wrist_data[1]))
         
-        # Create result object
+        # Secondary wrist (opposite hand)
+        secondary_wrist_idx = self.KEYPOINT_RIGHT_WRIST if self.use_right_hand else self.KEYPOINT_LEFT_WRIST
+        secondary_wrist_data = keypoints_np[secondary_wrist_idx]  # [x, y, conf]
+        secondary_wrist_position = None
+        secondary_wrist_confidence = float(secondary_wrist_data[2])
+        
+        if secondary_wrist_confidence > self.confidence_threshold:
+            secondary_wrist_position = (int(secondary_wrist_data[0]), int(secondary_wrist_data[1]))
+        
+        # Create primary result object
         primary_result = YoloPoseResult(
             pose_detected=True,
             keypoints=keypoints_np,
-            wrist_position=wrist_position,
-            wrist_confidence=wrist_confidence,
+            wrist_position=primary_wrist_position,
+            wrist_confidence=primary_wrist_confidence,
             bounding_box=bounding_box,
             detection_confidence=detection_conf,
             timestamp=timestamp
         )
         
-        # Secondary result is None (for now, only tracking one person)
-        return primary_result, None
+        # Create secondary result object if secondary wrist is detected
+        secondary_result = None
+        if secondary_wrist_position is not None:
+            secondary_result = YoloPoseResult(
+                pose_detected=True,
+                keypoints=keypoints_np,
+                wrist_position=secondary_wrist_position,
+                wrist_confidence=secondary_wrist_confidence,
+                bounding_box=bounding_box,
+                detection_confidence=detection_conf,
+                timestamp=timestamp
+            )
+        
+        return primary_result, secondary_result
     
     def get_annotated_frame(self, frame: np.ndarray, pose_result: Optional[YoloPoseResult]) -> np.ndarray:
         """
