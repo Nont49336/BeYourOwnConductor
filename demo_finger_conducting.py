@@ -29,9 +29,9 @@ def get_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description='Finger Conducting Demo')
     
-    parser.add_argument("--song_path", type=str, default='ode_to_joy.mid',
+    parser.add_argument("--song_path", type=str, default='resources/song/ode_to_joy.mid',
                         help='Path to the MIDI file to play (default: ode_to_joy.mid)')
-    parser.add_argument("--songfont_path", type=str, default='FluidR3Mono_GM.sf3',
+    parser.add_argument("--songfont_path", type=str, default='resources/FluidR3Mono_GM.sf3',
                         help='Path to the SoundFont file (default: FluidR3Mono_GM.sf3)')
     parser.add_argument("--device", type=int, default=0,
                        help='Camera device number (default: 0)')
@@ -49,7 +49,7 @@ def get_args():
                         help='Smoothing factor for velocity calculation (default: 4)')
     parser.add_argument("--neutral_velocity_threshold", type=float, default=0.24,
                         help='Neutral velocity threshold for gesture volume control (default: 0.3)')
-    parser.add_argument("--history_length", type=int, default=40,
+    parser.add_argument("--history_length", type=int, default=35,
                         help='Length of position history for conducting analysis (default: 40)')
     parser.add_argument("--use_yolo", action='store_true',
                         help='Use YOLO pose tracking instead of MediaPipe hand tracking')
@@ -137,7 +137,7 @@ def draw_smoothed_position_trail(image, conducting_frame: ConductingFrame):
     return image
 
 
-def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_time: float = 0.0):
+def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_time: float = 0.0,player=None):
     """Draw conducting information on the image."""
     h, w = image.shape[:2]
     
@@ -163,13 +163,21 @@ def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_
     line_height = 35
     
     # Tempo
-    if conducting_frame.tempo_estimate:
-        tempo_text = f"Tempo: {conducting_frame.tempo_estimate:.1f} BPM"
-        cv.putText(image, tempo_text, (10, info_y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv.LINE_AA)
-        cv.putText(image, tempo_text, (10, info_y),
-                  cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv.LINE_AA)
-        info_y += line_height
+    if conducting_frame.tempo_estimate == None:
+        conducting_frame.tempo_estimate = 0
+    original_tempo_text = f"Original Tempo: {player.get_tempo():.1f} BPM"
+    cv.putText(image, original_tempo_text, (10, info_y),
+            cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv.LINE_AA)
+    cv.putText(image, original_tempo_text, (10, info_y),
+            cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv.LINE_AA)
+    info_y += line_height
+    # Line 2: Estimated tempo
+    tempo_text = f"Tempo: {conducting_frame.tempo_estimate:.1f} BPM"
+    cv.putText(image, tempo_text, (10, info_y),
+            cv.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 3, cv.LINE_AA)
+    cv.putText(image, tempo_text, (10, info_y),
+            cv.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 1, cv.LINE_AA)
+    info_y += line_height
     
     # Beat info
     if conducting_frame.beat_index:
@@ -197,14 +205,14 @@ def draw_conducting_info(image, conducting_frame: ConductingFrame, beat_display_
     info_y += line_height
     
     # Energy bar
-    energy_text = f"Energy: {conducting_frame.gesture_energy:.2f}"
-    bar_length = int(200 * conducting_frame.gesture_energy)
-    cv.rectangle(image, (10, info_y - 20), (10 + bar_length, info_y - 5),
-                (0, 255, 0), -1)
-    cv.rectangle(image, (10, info_y - 20), (210, info_y - 5), (255, 255, 255), 1)
-    cv.putText(image, energy_text, (220, info_y - 5),
-              cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
-    info_y += line_height
+    # energy_text = f"Energy: {conducting_frame.gesture_energy:.2f}"
+    # bar_length = int(200 * conducting_frame.gesture_energy)
+    # cv.rectangle(image, (10, info_y - 20), (10 + bar_length, info_y - 5),
+    #             (0, 255, 0), -1)
+    # cv.rectangle(image, (10, info_y - 20), (210, info_y - 5), (255, 255, 255), 1)
+    # cv.putText(image, energy_text, (220, info_y - 5),
+    #           cv.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv.LINE_AA)
+    # info_y += line_height
     
     # Beat event display - show for 0.3 seconds after beat
     if beat_display_time > 0 and (time.time() - beat_display_time) < 0.3:
@@ -309,7 +317,7 @@ def draw_pattern_guide(image, conducting_analyzer):
     # Position in top-right corner (moved down to make room for velocity graph)
     h, w = image.shape[:2]
     start_x = w - 220
-    start_y = 150  # Moved down from 30 to make room for velocity graph
+    start_y = 30  # Moved up from 150 to delete the velocity graph
     
     # Draw background
     cv.rectangle(image, (start_x - 10, start_y - 25), (w - 10, start_y + 95),
@@ -1010,6 +1018,7 @@ def main():
                 if player is not None:
                     if not player.running:
                         # Arm playback - start countdown for tempo calibration
+                        player.current_beat_index = 0
                         waiting_for_conducting = True
                         countdown_active = True
                         countdown_beats_detected = 0
@@ -1317,11 +1326,11 @@ def main():
             
             # Draw conducting visualization
             if conducting_frame:
-                display_image = draw_conducting_info(display_image, conducting_frame, last_beat_time)
+                display_image = draw_conducting_info(display_image, conducting_frame, last_beat_time,player=player)
             
             # Draw velocity graph
-            if conducting_frame:
-                display_image = draw_velocity_graph(display_image, conducting_frame, args.neutral_velocity_threshold)
+            # if conducting_frame:
+            #     display_image = draw_velocity_graph(display_image, conducting_frame, args.neutral_velocity_threshold)
             
             # Draw pattern guide
             display_image = draw_pattern_guide(display_image, conducting_analyzer)
