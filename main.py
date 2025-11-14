@@ -51,7 +51,7 @@ def get_args():
                         help='Neutral velocity threshold for gesture volume control (default: 0.3)')
     parser.add_argument("--history_length", type=int, default=35,
                         help='Length of position history for conducting analysis (default: 40)')
-    parser.add_argument("--use_yolo", action='store_true',
+    parser.add_argument("--use_yolo", action='store_true', default=True,
                         help='Use YOLO pose tracking instead of MediaPipe hand tracking')
     parser.add_argument("--yolo_model", type=str, default='yolo11s-pose.pt',
                         help='YOLO pose model path (default: yolo11s-pose.pt)')

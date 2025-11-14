@@ -20,5 +20,5 @@ This is the project for the final project of Sound and Music Computing.
 ## Run the project
 To run the project, execute the following command:
 ```bash
-python demo_finger_conducting.py
+python main.py
 ```
