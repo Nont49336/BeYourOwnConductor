@@ -1,7 +1,6 @@
-ultralytics>=8.3.0
-opencv-python>=4.8.0
-tensorflow>=2.19.0
-mediapipe>=0.10.21
-mido>=1.3.3
-keyboard>=0.13.5
-pyfluidsynth>=1.3.4
+opencv-python
+mediapipe
+ultralytics
+mido
+tensorflow==2.16.1
+pyfluidsynth
