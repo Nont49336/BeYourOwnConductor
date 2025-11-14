@@ -13,12 +13,18 @@ This is the project for the final project of Sound and Music Computing.
    pip install -r requirements.txt
    ```
 4. install fluidsynth via conda
+
    ```bash
+   # macOS or Linux
    conda install -c conda-forge fluidsynth
+   # Windows
+   choco install fluidsynth
    ```
 
 ## Run the project
 To run the project, execute the following command:
 ```bash
-python demo_finger_conducting.py
+python demo_finger_conducting.py --use_yolo
 ```
+
+You can also look into the code for more options on how to run the demo.
